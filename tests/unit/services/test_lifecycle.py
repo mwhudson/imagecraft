@@ -93,15 +93,40 @@ def test_lifecycle_setup_registers_prologue(
 def test_lifecycle_prologue_hook(
     lifecycle_service: ImagecraftLifecycleService,
     mocker,
+    tmp_path,
 ):
+    from imagecraft.pack import diskutil
+
+    image_path = tmp_path / "pc.img"
+    image_path.write_bytes(b"\0" * 8192)  # 8 KiB stub disk
+
     mock_image_service = MagicMock()
-    mock_image_service.get_loop_paths.return_value = {
-        "pc": "/dev/loop8",
-        "pc/efi": "/dev/loop8p1",
-        "pc/rootfs": "/dev/loop8p2",
+    mock_image_service.get_images.return_value = {"pc": image_path}
+    mock_image_service._get_partition_numbers.return_value = {"efi": 1, "rootfs": 2}
+
+    mock_project = MagicMock()
+    efi_item = MagicMock()
+    efi_item.name = "efi"
+    rootfs_item = MagicMock()
+    rootfs_item.name = "rootfs"
+    mock_project.volumes = {"pc": MagicMock(structure=[efi_item, rootfs_item])}
+
+    def fake_service(name):
+        return {"image": mock_image_service, "project": MagicMock(get=lambda: mock_project)}[name]
+
+    mocker.patch.object(lifecycle_service._services, "get", side_effect=fake_service)
+
+    geometries = {
+        1: diskutil.PartitionGeometry(
+            sector_offset=2048, sector_count=1024, sector_size=512
+        ),
+        2: diskutil.PartitionGeometry(
+            sector_offset=3072, sector_count=2048, sector_size=512
+        ),
     }
-    mocker.patch.object(
-        lifecycle_service._services, "get", return_value=mock_image_service
+    mocker.patch(
+        "imagecraft.services.lifecycle.diskutil.get_partition_geometry",
+        side_effect=lambda *, imagepath, partition_number: geometries[partition_number],
     )
 
     project_info = MagicMock(spec=ProjectInfo)
@@ -110,9 +135,15 @@ def test_lifecycle_prologue_hook(
     lifecycle_service._prologue_hook(project_info)
 
     assert project_info.global_environment == {
-        "CRAFT_VOLUME_PC": "/dev/loop8",
-        "CRAFT_VOLUME_PC_EFI": "/dev/loop8p1",
-        "CRAFT_VOLUME_PC_ROOTFS": "/dev/loop8p2",
+        "CRAFT_VOLUME_PC_FILE": str(image_path),
+        "CRAFT_VOLUME_PC_OFFSET": "0",
+        "CRAFT_VOLUME_PC_SIZE": "8192",
+        "CRAFT_VOLUME_PC_EFI_FILE": str(image_path),
+        "CRAFT_VOLUME_PC_EFI_OFFSET": str(2048 * 512),
+        "CRAFT_VOLUME_PC_EFI_SIZE": str(1024 * 512),
+        "CRAFT_VOLUME_PC_ROOTFS_FILE": str(image_path),
+        "CRAFT_VOLUME_PC_ROOTFS_OFFSET": str(3072 * 512),
+        "CRAFT_VOLUME_PC_ROOTFS_SIZE": str(2048 * 512),
     }
     mock_image_service.create_images.assert_called_once()
-    mock_image_service.attach_images.assert_called_once()
+    mock_image_service.attach_images.assert_not_called()

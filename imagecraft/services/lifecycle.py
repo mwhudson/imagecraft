@@ -31,6 +31,7 @@ from craft_parts.plugins.plugins import PluginGroup
 from typing_extensions import override
 
 from imagecraft import models, plugins
+from imagecraft.pack import diskutil
 from imagecraft.services.image import ImageService
 
 
@@ -68,14 +69,52 @@ class ImagecraftLifecycleService(LifecycleService):
         callbacks.register_prologue(self._prologue_hook)
 
     def _prologue_hook(self, project_info: ProjectInfo) -> None:
-        """Create images and export loop device paths as environment variables."""
+        """Create images and export file/offset/size triples as environment variables.
+
+        For each volume and each partition within a volume, three variables are
+        published so that parts can write to specific byte ranges of the disk
+        image file directly (no loop device required):
+
+        - ``CRAFT_VOLUME_<NAME>_FILE``: absolute path to the disk image
+        - ``CRAFT_VOLUME_<NAME>_OFFSET``: byte offset of the region
+        - ``CRAFT_VOLUME_<NAME>_SIZE``: byte size of the region
+
+        ``<NAME>`` is the volume name for whole-disk entries, or
+        ``<VOLUME>_<PARTITION>`` for per-partition entries.
+
+        Use ``dd oflag=seek_bytes`` to seek by these byte offsets directly.
+        """
         image_service = cast(ImageService, self._services.get("image"))
         image_service.create_images()
-        image_service.attach_images()
 
-        for key, path in image_service.get_loop_paths().items():
-            env_key = f"CRAFT_VOLUME_{key.upper().replace('/', '_').replace('-', '_')}"
-            project_info.global_environment[env_key] = path
+        project = cast(models.Project, self._services.get("project").get())
+        env = project_info.global_environment
+
+        for vol_name, image_path in image_service.get_images().items():
+            volume = project.volumes[vol_name]
+
+            # Whole-volume triple.
+            vol_key = _env_key(vol_name)
+            env[f"CRAFT_VOLUME_{vol_key}_FILE"] = str(image_path)
+            env[f"CRAFT_VOLUME_{vol_key}_OFFSET"] = "0"
+            env[f"CRAFT_VOLUME_{vol_key}_SIZE"] = str(image_path.stat().st_size)
+
+            # Per-partition triples.
+            partition_numbers = image_service._get_partition_numbers(volume)  # noqa: SLF001
+            for structure_item in volume.structure:
+                part_num = partition_numbers[structure_item.name]
+                geometry = diskutil.get_partition_geometry(
+                    imagepath=image_path,
+                    partition_number=part_num,
+                )
+                part_key = f"{vol_key}_{_env_key(structure_item.name)}"
+                env[f"CRAFT_VOLUME_{part_key}_FILE"] = str(image_path)
+                env[f"CRAFT_VOLUME_{part_key}_OFFSET"] = str(
+                    geometry.sector_offset * geometry.sector_size
+                )
+                env[f"CRAFT_VOLUME_{part_key}_SIZE"] = str(
+                    geometry.sector_count * geometry.sector_size
+                )
 
     @override
     def _exec(self, actions: list[Action]) -> None:
@@ -88,3 +127,7 @@ class ImagecraftLifecycleService(LifecycleService):
                 details=str(err),
                 resolution="Run imagecraft clean",
             )
+
+
+def _env_key(name: str) -> str:
+    return name.upper().replace("/", "_").replace("-", "_")
