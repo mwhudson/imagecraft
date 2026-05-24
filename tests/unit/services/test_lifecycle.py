@@ -146,4 +146,3 @@ def test_lifecycle_prologue_hook(
         "CRAFT_VOLUME_PC_ROOTFS_SIZE": str(2048 * 512),
     }
     mock_image_service.create_images.assert_called_once()
-    mock_image_service.attach_images.assert_not_called()

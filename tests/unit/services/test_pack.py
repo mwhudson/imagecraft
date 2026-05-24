@@ -94,10 +94,6 @@ def test_pack(
     mock_grubutil = mocker.patch("imagecraft.services.pack.grubutil", autospec=True)
     mock_image_cls = mocker.patch("imagecraft.services.pack.Image", autospec=True)
 
-    # losetup-style methods must NOT be reached from the build path.
-    mock_attach = mocker.patch.object(mock_image_service, "attach_images")
-    mock_detach = mocker.patch.object(mock_image_service, "detach_images")
-
     result = pack_service.pack(prime_dir=prime_dir, dest=dest_path)
 
     # create_images is still called (it's idempotent).
@@ -138,10 +134,6 @@ def test_pack(
     # is truthy, so install should be called.
     mock_grubutil.install_grub_to_image.assert_called_once()
     mock_image_cls.assert_called_once()
-
-    # losetup-style methods must NOT have been called from pack().
-    mock_attach.assert_not_called()
-    mock_detach.assert_not_called()
 
     assert result == [dest_path / "pc.img"]
 

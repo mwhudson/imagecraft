@@ -11,8 +11,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-import re
-
 import pytest
 from craft_application import ServiceFactory
 from imagecraft.services.image import ImageService
@@ -24,8 +22,7 @@ pytestmark = [pytest.mark.usefixtures("enable_features")]
 def image_service(default_factory: ServiceFactory, enable_features):
     svc = default_factory.get("image")
     assert isinstance(svc, ImageService)
-    yield svc
-    svc._loop_devices.clear()
+    return svc
 
 
 def test_create_images_produces_hidden_files(image_service: ImageService, new_dir):
@@ -94,47 +91,3 @@ def test_finalize_images_creates_dest_dir(
     assert (dest / "pc.img").exists()
 
 
-@pytest.mark.requires_root
-def test_attach_and_detach_images(image_service: ImageService, new_dir):
-    """attach_images() attaches loop devices; detach_images() removes them."""
-    image_service.create_images()
-    image_service.attach_images()
-
-    assert "pc" in image_service._loop_devices
-    loop_dev = image_service._loop_devices["pc"]
-    assert loop_dev.startswith("/dev/loop")
-
-    image_service.detach_images()
-    assert image_service._loop_devices == {}
-
-
-@pytest.mark.requires_root
-def test_attach_images_is_idempotent(image_service: ImageService, new_dir):
-    """Calling attach_images() twice reuses the existing loop device."""
-    image_service.create_images()
-    image_service.attach_images()
-    first_device = dict(image_service._loop_devices)
-
-    image_service.attach_images()
-    assert image_service._loop_devices == first_device
-
-    image_service.detach_images()
-
-
-@pytest.mark.requires_root
-def test_get_partition_loop_paths(image_service: ImageService, new_dir):
-    """get_loop_paths() returns volume and partition paths."""
-    image_service.create_images()
-    image_service.attach_images()
-
-    paths = image_service.get_loop_paths()
-
-    # Volume-level device
-    assert "pc" in paths
-    assert re.match(r"^/dev/loop[0-9]+$", paths["pc"])
-
-    # default_project_yaml has efi (p1) and rootfs (p2)
-    assert paths["pc/efi"].endswith("p1")
-    assert paths["pc/rootfs"].endswith("p2")
-
-    image_service.detach_images()

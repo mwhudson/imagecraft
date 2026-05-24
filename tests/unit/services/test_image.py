@@ -12,7 +12,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import subprocess
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -25,10 +24,7 @@ from imagecraft.services.image import ImageService
 
 @pytest.fixture
 def image_service(default_factory: ServiceFactory):
-    svc = cast(ImageService, default_factory.get("image"))
-    yield svc
-    # Prevent atexit handlers registered during tests from firing with real devices.
-    svc._loop_devices.clear()
+    return cast(ImageService, default_factory.get("image"))
 
 
 @pytest.fixture
@@ -123,125 +119,15 @@ def test_create_images_idempotent(image_service, default_factory, mock_project, 
         mock_get.assert_called_once()  # Only called once
 
 
-def test_attach_images_new(image_service, project_dir, mocker):
-    image_service._images = {"pc": project_dir / ".pc.img.tmp"}
+def test_get_partition_numbers_gpt(image_service, mock_project):
+    """GPT: numbers are 1-based positions, honouring explicit partition_number."""
+    numbers = image_service._get_partition_numbers(mock_project.volumes["pc"])
 
-    mock_run = mocker.patch("imagecraft.services.image.run")
-    # Mock _get_all_loop_devices returns empty
-    mocker.patch.object(image_service, "_get_all_loop_devices", return_value=[])
-
-    mock_run.return_value.stdout = "/dev/loop8\n"
-
-    with patch("atexit.register") as mock_atexit:
-        devices = image_service.attach_images()
-
-        assert devices == {"pc": "/dev/loop8"}
-        mock_run.assert_called_with(
-            "losetup",
-            "--find",
-            "--show",
-            "--partscan",
-            str(project_dir / ".pc.img.tmp"),
-        )
-        mock_atexit.assert_called_once_with(image_service.detach_images)
+    # efi has no explicit number -> position 1; rootfs has partition_number=2.
+    assert numbers == {"efi": 1, "rootfs": 2}
 
 
-def test_attach_images_reuse(image_service, project_dir, mocker):
-    image_path = project_dir / ".pc.img.tmp"
-    image_path.touch()
-    image_service._images = {"pc": image_path}
-
-    # Mock existing loop device
-    mocker.patch.object(
-        image_service,
-        "_get_all_loop_devices",
-        return_value=[{"name": "/dev/loop9", "back-file": str(image_path)}],
-    )
-
-    # Mock samefile to return True
-    mocker.patch("pathlib.Path.samefile", return_value=True)
-    mock_run = mocker.patch("imagecraft.services.image.run")
-
-    devices = image_service.attach_images()
-
-    assert devices == {"pc": "/dev/loop9"}
-    mock_run.assert_not_called()  # Should not call losetup attach
-
-
-def test_attach_images_stale_inode(image_service, project_dir, mocker):
-    image_path = project_dir / ".pc.img.tmp"
-    image_path.touch()
-    image_service._images = {"pc": image_path}
-
-    # Mock existing loop device
-    mocker.patch.object(
-        image_service,
-        "_get_all_loop_devices",
-        return_value=[{"name": "/dev/loop10", "back-file": str(image_path)}],
-    )
-
-    # Mock samefile to raise FileNotFoundError (stale inode)
-    mocker.patch("pathlib.Path.samefile", side_effect=FileNotFoundError)
-    mock_run = mocker.patch("imagecraft.services.image.run")
-    mock_run.return_value.stdout = "/dev/loop11\n"
-
-    devices = image_service.attach_images()
-
-    assert devices == {"pc": "/dev/loop11"}
-    # Should detach stale
-    mock_run.assert_any_call("losetup", "-d", "/dev/loop10")
-    # Should attach new
-    mock_run.assert_any_call(
-        "losetup", "--find", "--show", "--partscan", str(image_path)
-    )
-
-
-def test_detach_images_success(image_service, mocker):
-    image_service._loop_devices = {"pc": "/dev/loop8"}
-    mock_run = mocker.patch("imagecraft.services.image.run")
-
-    image_service.detach_images()
-
-    mock_run.assert_called_once_with("losetup", "-d", "/dev/loop8")
-    assert image_service._loop_devices == {}
-
-
-def test_detach_images_retry(image_service, mocker):
-    image_service._loop_devices = {"pc": "/dev/loop8"}
-    mock_run = mocker.patch("imagecraft.services.image.run")
-
-    # Fail twice, then succeed
-    mock_run.side_effect = [
-        subprocess.CalledProcessError(1, "losetup"),
-        subprocess.CalledProcessError(1, "losetup"),
-        MagicMock(),
-    ]
-
-    mocker.patch("time.monotonic", side_effect=[0, 1, 2, 3, 4])
-    mocker.patch("time.sleep")
-
-    image_service.detach_images()
-
-    assert mock_run.call_count == 3
-    assert image_service._loop_devices == {}
-
-
-def test_get_loop_paths(image_service, default_factory, mock_project, mocker):
-    image_service._loop_devices = {"pc": "/dev/loop8"}
-    mocker.patch.object(
-        default_factory.get("project"), "get", return_value=mock_project
-    )
-
-    mapping = image_service.get_loop_paths()
-
-    assert mapping == {
-        "pc": "/dev/loop8",
-        "pc/efi": "/dev/loop8p1",
-        "pc/rootfs": "/dev/loop8p2",
-    }
-
-
-def test_get_loop_paths_mbr_plain(image_service, default_factory, mocker):
+def test_get_partition_numbers_mbr_plain(image_service):
     """MBR with ≤4 partitions: numbers are plain 1-based positions."""
     vol = MBRVolume.unmarshal(
         {
@@ -264,23 +150,13 @@ def test_get_loop_paths_mbr_plain(image_service, default_factory, mocker):
             ],
         }
     )
-    mock_project = MagicMock(spec=Project)
-    mock_project.volumes = {"pi": vol}
-    mocker.patch.object(
-        default_factory.get("project"), "get", return_value=mock_project
-    )
-    image_service._loop_devices = {"pi": "/dev/loop8"}
 
-    mapping = image_service.get_loop_paths()
+    numbers = image_service._get_partition_numbers(vol)
 
-    assert mapping == {
-        "pi": "/dev/loop8",
-        "pi/boot": "/dev/loop8p1",
-        "pi/rootfs": "/dev/loop8p2",
-    }
+    assert numbers == {"boot": 1, "rootfs": 2}
 
 
-def test_get_loop_paths_mbr_extended(image_service, default_factory, mocker):
+def test_get_partition_numbers_mbr_extended(image_service):
     """MBR with >4 partitions: logical partitions start at 5, skipping slot 4."""
     vol = MBRVolume.unmarshal(
         {
@@ -324,22 +200,15 @@ def test_get_loop_paths_mbr_extended(image_service, default_factory, mocker):
             ],
         }
     )
-    mock_project = MagicMock(spec=Project)
-    mock_project.volumes = {"pi": vol}
-    mocker.patch.object(
-        default_factory.get("project"), "get", return_value=mock_project
-    )
-    image_service._loop_devices = {"pi": "/dev/loop8"}
 
-    mapping = image_service.get_loop_paths()
+    numbers = image_service._get_partition_numbers(vol)
 
-    assert mapping == {
-        "pi": "/dev/loop8",
-        "pi/boot": "/dev/loop8p1",
-        "pi/p2": "/dev/loop8p2",
-        "pi/p3": "/dev/loop8p3",
-        "pi/logical1": "/dev/loop8p5",
-        "pi/logical2": "/dev/loop8p6",
+    assert numbers == {
+        "boot": 1,
+        "p2": 2,
+        "p3": 3,
+        "logical1": 5,
+        "logical2": 6,
     }
 
 
