@@ -5,8 +5,6 @@ This document describes the obstacles encountered when trying to run
 taken to overcome each one. The obstacles are presented in the order they
 would cause a run to fail — i.e., the order you would encounter them if
 you started from the original code and ran it unmodified in the container.
-It is intended as a design record for anyone maintaining or extending this
-work.
 
 ## Background
 
