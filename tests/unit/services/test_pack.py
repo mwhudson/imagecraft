@@ -92,7 +92,9 @@ def test_pack(
         "imagecraft.services.pack.diskutil.inject_partition_into_image",
     )
     mock_grubutil = mocker.patch("imagecraft.services.pack.grubutil", autospec=True)
-    mock_image_cls = mocker.patch("imagecraft.services.pack.Image", autospec=True)
+    mock_rawcontent = mocker.patch(
+        "imagecraft.services.pack.rawcontent", autospec=True
+    )
 
     result = pack_service.pack(prime_dir=prime_dir, dest=dest_path)
 
@@ -129,11 +131,12 @@ def test_pack(
     # rootfs prime dir gets /boot/grub/grub.cfg before mke2fs -d reads
     # it), install runs AFTER finalize_images.
     mock_grubutil.prepare_grub_assets.assert_called_once()
-    # install_grub_to_image is only called when prepare returned a
-    # non-None GrubAssets; the autospec mock returns a MagicMock which
-    # is truthy, so install should be called.
-    mock_grubutil.install_grub_to_image.assert_called_once()
-    mock_image_cls.assert_called_once()
+    # When prepare returns a non-None GrubAssets (the autospec mock
+    # returns a truthy MagicMock), pack translates it to raw-content
+    # records via grubutil policy, then hands them to the generic,
+    # GRUB-agnostic rawcontent applier.
+    mock_grubutil.grub_raw_content.assert_called_once()
+    mock_rawcontent.apply_raw_content.assert_called_once()
 
     assert result == [dest_path / "pc.img"]
 
@@ -154,7 +157,7 @@ def test_pack_size_mismatch_raises(
     mocker.patch.object(mock_image_service, "verify_images")
     mocker.patch.object(mock_image_service, "finalize_images")
     mocker.patch("imagecraft.services.pack.grubutil", autospec=True)
-    mocker.patch("imagecraft.services.pack.Image", autospec=True)
+    mocker.patch("imagecraft.services.pack.rawcontent", autospec=True)
 
     # Return geometry with a wrong sector count.
     bogus_geometry = diskutil.PartitionGeometry(
