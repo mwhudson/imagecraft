@@ -102,7 +102,7 @@ def mcopy(request, content, imagepath):
     return [
         "bash",
         "-c",
-        f"mcopy -n -o -s -i{str(imagepath)} {str(content)}/* ::",
+        f"LC_ALL=C mcopy -n -o -s -i{str(imagepath)} {str(content)}/* ::",
     ]
 
 
@@ -111,7 +111,7 @@ def mcopy_device(request, content, device):
     return [
         "bash",
         "-c",
-        f"mcopy -n -o -s -i{str(device)} {str(content)}/* ::",
+        f"LC_ALL=C mcopy -n -o -s -i{str(device)} {str(content)}/* ::",
     ]
 
 
@@ -273,6 +273,7 @@ def test_format_populate_partition_fat_with_offset(mocker, content, imagepath):
     # mcopy targets the image at the partition's byte offset.
     mcopy_args = mocked_run.call_args_list[1].args
     assert mcopy_args[0] == "bash"
+    assert "LC_ALL=C mcopy" in mcopy_args[2]
     assert f"-i{imagepath}@@{2048 * 512}" in mcopy_args[2]
 
 

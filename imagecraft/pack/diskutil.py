@@ -247,7 +247,7 @@ def _format_populate_fat_partition(  # pylint: disable=too-many-arguments
         image_arg = str(partitionpath)
         if offset_bytes:
             image_arg = f"{image_arg}@@{offset_bytes}"
-        mcopy_cmd = f"mcopy -n -o -s -i{image_arg} {content_dir}/* ::"
+        mcopy_cmd = f"LC_ALL=C mcopy -n -o -s -i{image_arg} {content_dir}/* ::"
         with emit.open_stream("Copying files to partition") as stream:
             run("bash", "-c", mcopy_cmd, stdout=stream, stderr=stream)
 
