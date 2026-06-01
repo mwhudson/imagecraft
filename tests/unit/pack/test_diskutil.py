@@ -177,6 +177,77 @@ def test_format_populate_partition_ext_with_offset(mocker, content, imagepath):
     assert f"{32768 * 512 // 1024}k" == args[-1]
 
 
+def test_format_populate_partition_ext_with_uuid(mocker, content, imagepath):
+    """A pre-allocated UUID is forwarded to mke2fs via -U."""
+    mocked_run = mocker.patch("imagecraft.pack.diskutil.run", autospec=True)
+    test_uuid = "12345678-1234-5678-1234-567812345678"
+
+    diskutil.format_populate_partition(
+        fstype=FileSystem.EXT4,
+        content_dir=content,
+        partitionpath=imagepath,
+        label="writable",
+        uuid=test_uuid,
+    )
+
+    args = mocked_run.call_args_list[0].args
+    assert args[0] == "mke2fs"
+    assert "-U" in args
+    assert test_uuid in args
+
+
+def test_format_populate_partition_ext_without_uuid(mocker, content, imagepath):
+    """Without a UUID, mke2fs is not given -U (it generates one itself)."""
+    mocked_run = mocker.patch("imagecraft.pack.diskutil.run", autospec=True)
+
+    diskutil.format_populate_partition(
+        fstype=FileSystem.EXT4,
+        content_dir=content,
+        partitionpath=imagepath,
+        label="writable",
+    )
+
+    args = mocked_run.call_args_list[0].args
+    assert "-U" not in args
+
+
+def test_format_populate_partition_vfat_with_offset_forces_fat32_and_spc(
+    mocker, content, imagepath
+):
+    """VFAT with offset+size passes -F 32 -s to avoid cluster-count failures.
+
+    When a partition sits inside a larger disk image, mkfs.fat picks a cluster
+    size based on the full device size, not the partition size.  For a 256 MiB
+    EFI partition in a 5+ GiB image the resulting cluster count falls below
+    FAT32's minimum, causing mkfs.fat to abort.  diskutil must supply -F 32
+    and -s to override the default.
+    """
+    mocked_run = mocker.patch("imagecraft.pack.diskutil.run")
+    # 256 MiB partition, 512-byte sectors, starting at sector 2048.
+    sector_size = 512
+    total_sectors = 524288  # 256 MiB
+    geometry = diskutil.PartitionGeometry(
+        sector_offset=2048, sector_count=total_sectors, sector_size=sector_size
+    )
+
+    diskutil.format_populate_partition(
+        fstype=FileSystem.VFAT,
+        content_dir=content,
+        partitionpath=imagepath,
+        label="UEFI",
+        geometry=geometry,
+    )
+
+    mkfs_args = mocked_run.call_args_list[0].args
+    assert mkfs_args[0] == "mkfs.vfat"
+    assert "-F" in mkfs_args
+    assert "32" in mkfs_args
+    assert "-s" in mkfs_args
+    # With 524288 sectors targeting ~131072 clusters: spc = 524288//131072 = 4.
+    spc_idx = list(mkfs_args).index("-s")
+    assert mkfs_args[spc_idx + 1] == "4"
+
+
 def test_format_populate_partition_fat_with_offset(mocker, content, imagepath):
     """A FAT partition with geometry passes --offset to mkfs.fat and @@ to mcopy."""
     mocked_run = mocker.patch("imagecraft.pack.diskutil.run", autospec=True)

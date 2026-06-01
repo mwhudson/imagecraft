@@ -89,9 +89,7 @@ def test_pack(
         "imagecraft.services.pack.diskutil.format_populate_partition",
     )
     mock_grubutil = mocker.patch("imagecraft.services.pack.grubutil", autospec=True)
-    mock_rawcontent = mocker.patch(
-        "imagecraft.services.pack.rawcontent", autospec=True
-    )
+    mock_rawcontent = mocker.patch("imagecraft.services.pack.rawcontent", autospec=True)
 
     result = pack_service.pack(prime_dir=prime_dir, dest=dest_path)
 
@@ -104,6 +102,9 @@ def test_pack(
 
     # Each format_populate call writes directly into the disk image at the
     # partition's geometry, using the structure's fstype/label.
+    # The rootfs (system-data) partition must receive the pre-allocated UUID
+    # from grub_assets so mke2fs stamps the same UUID that grub.cfg references.
+    grub_assets = mock_grubutil.prepare_grub_assets.return_value
     for call_args, structure_item in zip(
         mock_format_populate.call_args_list, volume.structure, strict=True
     ):
@@ -113,6 +114,10 @@ def test_pack(
         # partitionpath is the disk image itself (no intermediate temp file).
         assert kwargs["partitionpath"] == tmp_path / ".pc.img.tmp"
         assert kwargs["geometry"] == geometries[structure_item.name]
+        if structure_item.name == grub_assets.rootfs_partition_name:
+            assert kwargs["uuid"] == grub_assets.rootfs_uuid
+        else:
+            assert kwargs.get("uuid") is None
 
     mock_verify.assert_called_once()
     mock_finalize.assert_called_once_with(dest_path)

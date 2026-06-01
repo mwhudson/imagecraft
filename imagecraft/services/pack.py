@@ -99,12 +99,25 @@ class ImagecraftPackService(PackageService):
             # writing at an offset, so this avoids losetup (needed to run
             # inside unprivileged LXD containers) as well as the intermediate
             # per-partition copy that a temp file + dd would require.
+            #
+            # For the rootfs (system-data) partition, pass the pre-allocated
+            # UUID so that the on-disk UUID matches what update-grub embedded
+            # in grub.cfg via the grub-probe stub.
+            partition_uuid: str | None = None
+            if (
+                grub_assets is not None
+                and grub_assets.rootfs_partition_name is not None
+                and structure_item.name == grub_assets.rootfs_partition_name
+            ):
+                partition_uuid = grub_assets.rootfs_uuid
+
             diskutil.format_populate_partition(
                 fstype=structure_item.filesystem,
                 content_dir=partition_prime_dir,
                 partitionpath=image_path,
                 label=structure_item.filesystem_label,
                 geometry=geometry,
+                uuid=partition_uuid,
             )
 
         image_service.verify_images()
@@ -118,9 +131,7 @@ class ImagecraftPackService(PackageService):
         if grub_assets is not None:
             raw_content = grubutil.grub_raw_content(grub_assets)
             for path in images.values():
-                rawcontent.apply_raw_content(
-                    disk_path=path, contents=raw_content
-                )
+                rawcontent.apply_raw_content(disk_path=path, contents=raw_content)
 
         return list(images.values())
 

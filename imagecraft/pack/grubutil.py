@@ -50,6 +50,7 @@ without doing anything — see :func:`setup_grub` for the entry point.
 import dataclasses
 import shutil
 import subprocess
+import uuid as _uuid_mod
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -118,6 +119,60 @@ configfile $prefix/grub.cfg
 
 _OS_PROBER_PATH = "/etc/grub.d/30_os-prober"
 
+_GRUB_PROBE_PATH = "/usr/sbin/grub-probe"
+
+# Shell script written over the real grub-probe while update-grub runs inside
+# the chroot.  grub-mkconfig calls grub-probe to discover the block device and
+# UUID for / and /boot; in an unprivileged container the real grub-probe fails
+# because the rootfs lives on the host's ZFS pool whose vdevs are not exposed
+# in the container's /dev.  The stub returns fixed values derived from the UUID
+# that imagecraft will later pass to mke2fs -U, so the generated grub.cfg
+# references the correct UUID from the start.
+#
+# Argument forms handled (as produced by grub-mkconfig.in and
+# grub-mkconfig_lib.in):
+#   grub-probe --target=TARG [PATH]
+#   grub-probe -t TARG [PATH]
+#   grub-probe --device DEV --target=TARG
+_GRUB_PROBE_STUB = """\
+#!/bin/sh
+# Imagecraft grub-probe stub — removed after update-grub completes.
+ROOTFS_UUID=@@ROOTFS_UUID@@
+FAKE_DEVICE=/dev/sda1
+FAKE_FS=ext4
+FAKE_PARTMAP=gpt
+
+target=""
+next_is_target=false
+for arg in "$@"; do
+    if $next_is_target; then
+        target="$arg"
+        next_is_target=false
+        continue
+    fi
+    case "$arg" in
+        --target=*) target="${arg#--target=}" ;;
+        -t)         next_is_target=true ;;
+    esac
+done
+
+case "$target" in
+    device)             echo "$FAKE_DEVICE" ;;
+    fs_uuid)            echo "$ROOTFS_UUID" ;;
+    partuuid)           echo "" ;;
+    fs)                 echo "$FAKE_FS" ;;
+    partmap)            echo "$FAKE_PARTMAP" ;;
+    abstraction)        echo "" ;;
+    fs_label)           echo "" ;;
+    drive)              echo "(hd0,gpt1)" ;;
+    compatibility_hint) echo "" ;;
+    hints_string)       echo "" ;;
+    cryptodisk_uuid)    echo "" ;;
+    *)                  echo "" ;;
+esac
+exit 0
+"""
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -141,6 +196,21 @@ class GrubAssets:
     bios_boot_partition_name: str | None = None
     """Name of the GPT ef02 partition that core.img should be written
     to. ``None`` for MBR (where core.img goes into the post-MBR gap)."""
+
+    rootfs_uuid: str | None = None
+    """UUID pre-allocated for the rootfs (system-data) ext4 partition.
+
+    Embedded in grub.cfg by the grub-probe stub at update-grub time,
+    then passed to ``mke2fs -U`` when the partition is formatted so that
+    the on-disk UUID matches what grub.cfg references.
+    """
+
+    rootfs_partition_name: str | None = None
+    """Structure name (e.g. ``"rootfs"``) of the system-data partition.
+
+    Used by the pack service to identify which partition receives the
+    pre-allocated :attr:`rootfs_uuid` at mke2fs time.
+    """
 
 
 def setup_grub(
@@ -250,6 +320,11 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
     assets_dir = workdir / "grub-assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-allocate the rootfs filesystem UUID.  The grub-probe stub will
+    # embed this UUID in the grub.cfg that update-grub generates; mke2fs
+    # will later receive it via -U so the on-disk UUID matches.
+    rootfs_uuid = str(_uuid_mod.uuid4())
+
     # Compute the -p prefix for core.img. On GPT the BIOS-boot
     # partition's core.img loads grub modules from /boot/grub on the
     # rootfs partition (which is `gpt2` in a typical efi+rootfs layout
@@ -265,11 +340,10 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
         chroot.execute(
             target=_build_grub_in_chroot,
             core_prefix=core_prefix,
+            rootfs_uuid=rootfs_uuid,
         )
     except errors.ChrootMountError as err:
-        emit.progress(
-            f"Cannot install GRUB on this rootfs: {err}", permanent=True
-        )
+        emit.progress(f"Cannot install GRUB on this rootfs: {err}", permanent=True)
         return None
 
     # Pull boot.img and core.img out of the rootfs (they live at known
@@ -312,6 +386,8 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
         bios_boot_partition_name=(
             bios_boot_struct.name if bios_boot_struct is not None else None
         ),
+        rootfs_uuid=rootfs_uuid,
+        rootfs_partition_name=rootfs_struct.name,
     )
 
 
@@ -353,9 +429,7 @@ def grub_raw_content(assets: GrubAssets) -> list[rawcontent.RawContent]:
             # MBR: core.img lives in the post-MBR gap, which starts at
             # sector 1 and runs up to the first partition (usually 2048
             # sectors of slack).
-            target = rawcontent.SectorOffset(
-                sector=1, sector_size=_SECTOR_SIZE
-            )
+            target = rawcontent.SectorOffset(sector=1, sector_size=_SECTOR_SIZE)
         items.append(
             rawcontent.RawContent(
                 source=assets.core_img,
@@ -413,9 +487,7 @@ def _partition_number(volume: "Volume", target: StructureItem) -> int:
             explicit = getattr(item, "partition_number", None)
             return int(explicit) if explicit is not None else i
     # Should never happen — caller already located the structure.
-    raise errors.ImageError(
-        f"Cannot determine partition number for {target.name!r}"
-    )
+    raise errors.ImageError(f"Cannot determine partition number for {target.name!r}")
 
 
 def _ensure_chroot_mountpoints(rootfs_prime: Path) -> None:
@@ -460,7 +532,7 @@ def _phase_b_chroot_mounts() -> list[Mount]:
     ]
 
 
-def _build_grub_in_chroot(core_prefix: str) -> None:
+def _build_grub_in_chroot(core_prefix: str, rootfs_uuid: str) -> None:
     """Run inside the rootfs chroot: update-grub + grub-mkimage.
 
     Produces ``/boot/grub/grub.cfg`` (so it lands in the rootfs prime
@@ -471,16 +543,28 @@ def _build_grub_in_chroot(core_prefix: str) -> None:
     Does NOT call ``grub-install`` — that would need a target device.
     The MBR boot.img and the core.img are written by the parent process
     after the disk image is assembled.
+
+    ``rootfs_uuid`` is the UUID pre-allocated for the rootfs partition.
+    It is injected into a grub-probe stub so that ``grub-mkconfig``
+    generates a ``grub.cfg`` referencing this UUID, which mke2fs will
+    later be asked to stamp onto the filesystem with ``-U``.
     """
     # update-grub writes /boot/grub/grub.cfg by scanning /boot for
     # kernels. We keep the os-prober diversion from the legacy flow so
     # the chroot doesn't pick up the host's other operating systems.
-    divert_args = [
+    os_prober_divert_args = [
         "--local",
         "--divert",
         _OS_PROBER_PATH + ".dpkg-divert",
         "--rename",
         _OS_PROBER_PATH,
+    ]
+    grub_probe_divert_args = [
+        "--local",
+        "--divert",
+        _GRUB_PROBE_PATH + ".dpkg-divert",
+        "--rename",
+        _GRUB_PROBE_PATH,
     ]
 
     try:
@@ -492,21 +576,46 @@ def _build_grub_in_chroot(core_prefix: str) -> None:
         )
         return
 
+    # Divert os-prober so update-grub doesn't detect the host's OSes.
+    run("dpkg-divert", *os_prober_divert_args, stderr=subprocess.STDOUT)
+    # Divert the real grub-probe and replace it with a stub that returns
+    # the pre-allocated rootfs UUID.  The real grub-probe would fail in
+    # an unprivileged container because the block device backing the ZFS
+    # root is not exposed in the container's /dev.
+    run("dpkg-divert", *grub_probe_divert_args, stderr=subprocess.STDOUT)
+    Path(_GRUB_PROBE_PATH).write_text(
+        _GRUB_PROBE_STUB.replace("@@ROOTFS_UUID@@", rootfs_uuid)
+    )
+    Path(_GRUB_PROBE_PATH).chmod(0o755)
+    # 10_linux.in checks ``test -e /dev/disk/by-uuid/$GRUB_DEVICE_UUID``
+    # to decide whether to use ``root=UUID=...`` or fall back to the raw
+    # device name.  Create a symlink so the check passes and the
+    # generated grub.cfg uses the UUID (which matches what mke2fs gets).
+    by_uuid_link = Path("/dev/disk/by-uuid") / rootfs_uuid
+    by_uuid_link.parent.mkdir(parents=True, exist_ok=True)
+    by_uuid_link.symlink_to("/dev/null")
+
     try:
-        run("dpkg-divert", *divert_args, stderr=subprocess.STDOUT)
-        try:
-            res = run("update-grub", stderr=subprocess.STDOUT)
-            if res.stdout:
-                emit.debug(res.stdout)
-        finally:
-            run(
-                "dpkg-divert",
-                "--remove",
-                *divert_args,
-                stderr=subprocess.STDOUT,
-            )
+        res = run("update-grub", stderr=subprocess.STDOUT)
+        if res.stdout:
+            emit.debug(res.stdout)
     except subprocess.CalledProcessError as err:
         raise errors.GRUBInstallError("Failed to run update-grub") from err
+    finally:
+        by_uuid_link.unlink(missing_ok=True)
+        Path(_GRUB_PROBE_PATH).unlink(missing_ok=True)
+        run(
+            "dpkg-divert",
+            "--remove",
+            *grub_probe_divert_args,
+            stderr=subprocess.STDOUT,
+        )
+        run(
+            "dpkg-divert",
+            "--remove",
+            *os_prober_divert_args,
+            stderr=subprocess.STDOUT,
+        )
 
     # grub-mkimage to produce the BIOS core.img. The -p prefix tells
     # the core where to find /boot/grub on the final disk.

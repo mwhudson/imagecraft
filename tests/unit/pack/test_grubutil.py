@@ -14,6 +14,7 @@
 
 """Unit tests for the Phase-B (no-loop, no-image-mount) grub setup."""
 
+import uuid as uuid_mod
 from pathlib import Path
 
 import pytest
@@ -212,9 +213,7 @@ def test_phase_b_chroot_mounts_has_no_devtmpfs():
 def test_prepare_grub_assets_non_amd64_emits_todo(
     tmp_path, gpt_volume_efi_rootfs, emitter, arch
 ):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_efi_rootfs.structure
-    )
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_efi_rootfs.structure)
 
     result = prepare_grub_assets(
         arch=arch,
@@ -231,9 +230,7 @@ def test_prepare_grub_assets_non_amd64_emits_todo(
     )
 
 
-def test_prepare_grub_assets_skips_when_no_data_partition(
-    tmp_path, emitter
-):
+def test_prepare_grub_assets_skips_when_no_data_partition(tmp_path, emitter):
     volume = GPTVolume.unmarshal(
         {
             "schema": "gpt",
@@ -268,9 +265,7 @@ def test_prepare_grub_assets_skips_when_no_data_partition(
 def test_prepare_grub_assets_skips_gpt_when_no_boot_partition(
     tmp_path, gpt_volume_rootfs_only, emitter
 ):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_rootfs_only.structure
-    )
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_rootfs_only.structure)
 
     result = prepare_grub_assets(
         arch=DebianArchitecture.AMD64,
@@ -290,12 +285,8 @@ def test_prepare_grub_assets_skips_gpt_when_no_boot_partition(
 # ── prepare_grub_assets: success cases ────────────────────────────────────────
 
 
-def test_prepare_grub_assets_amd64_gpt_efi(
-    mocker, tmp_path, gpt_volume_efi_rootfs
-):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_efi_rootfs.structure
-    )
+def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_rootfs):
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_efi_rootfs.structure)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     esp_prime = prime_dirs["volume/pc/efi"]
     _populate_rootfs_with_grub_files(rootfs_prime)
@@ -303,7 +294,9 @@ def test_prepare_grub_assets_amd64_gpt_efi(
     # /tmp/imagecraft-core.img inside the chroot (which IS rootfs_prime).
     (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
 
-    def fake_execute(*, target, core_prefix):
+    def fake_execute(*, target, core_prefix, rootfs_uuid):
+        # rootfs_uuid must be a valid UUID string.
+        uuid_mod.UUID(rootfs_uuid)
         # Reproduce what _build_grub_in_chroot would create.
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # Also produce the kernel-listing grub.cfg that update-grub
@@ -331,6 +324,10 @@ def test_prepare_grub_assets_amd64_gpt_efi(
     assert result.core_img.read_bytes() == b"CORE"
     # No ef02 in this layout — core.img goes elsewhere on disk.
     assert result.bios_boot_partition_name is None
+    # A rootfs UUID must be pre-allocated and stored.
+    assert result.rootfs_uuid is not None
+    uuid_mod.UUID(result.rootfs_uuid)  # must be a valid UUID
+    assert result.rootfs_partition_name == "rootfs"
 
     # ESP prime dir should now contain shim + signed grub + grub.cfg stub.
     assert (esp_prime / "EFI/BOOT/BOOTX64.EFI").read_bytes() == b"SHIMX64"
@@ -354,13 +351,11 @@ def test_prepare_grub_assets_amd64_gpt_efi(
 def test_prepare_grub_assets_amd64_gpt_with_bios_boot(
     mocker, tmp_path, gpt_volume_with_bios_boot
 ):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_with_bios_boot.structure
-    )
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_with_bios_boot.structure)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix):
+    def fake_execute(*, target, core_prefix, rootfs_uuid):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # rootfs is the third partition in this layout (bios-boot, efi,
@@ -383,16 +378,12 @@ def test_prepare_grub_assets_amd64_gpt_with_bios_boot(
     assert result.bios_boot_partition_name == "bios-boot"
 
 
-def test_prepare_grub_assets_amd64_mbr(
-    mocker, tmp_path, mbr_volume_boot_rootfs
-):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", mbr_volume_boot_rootfs.structure
-    )
+def test_prepare_grub_assets_amd64_mbr(mocker, tmp_path, mbr_volume_boot_rootfs):
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", mbr_volume_boot_rootfs.structure)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix):
+    def fake_execute(*, target, core_prefix, rootfs_uuid):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # MBR prefix uses msdos<N>, not gpt<N>.
@@ -418,9 +409,7 @@ def test_prepare_grub_assets_amd64_mbr(
 def test_prepare_grub_assets_missing_shim_raises(
     mocker, tmp_path, gpt_volume_efi_rootfs
 ):
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_efi_rootfs.structure
-    )
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_efi_rootfs.structure)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     # Provide grub-signed and boot.img but NOT shim.
     grub_dir = rootfs_prime / "usr/lib/grub/x86_64-efi-signed"
@@ -430,7 +419,7 @@ def test_prepare_grub_assets_missing_shim_raises(
     bios_dir.mkdir(parents=True, exist_ok=True)
     (bios_dir / "boot.img").write_bytes(b"X" * 512)
 
-    def fake_execute(*, target, core_prefix):
+    def fake_execute(*, target, core_prefix, rootfs_uuid):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
 
@@ -514,9 +503,7 @@ def test_install_grub_to_image_delegates_to_applier(
         bios_boot_partition_name=None,
     )
 
-    mock_apply = mocker.patch(
-        "imagecraft.pack.grubutil.rawcontent.apply_raw_content"
-    )
+    mock_apply = mocker.patch("imagecraft.pack.grubutil.rawcontent.apply_raw_content")
 
     install_grub_to_image(image=image, assets=assets)
 
@@ -529,16 +516,12 @@ def test_install_grub_to_image_delegates_to_applier(
 # ── setup_grub orchestration ──────────────────────────────────────────────────
 
 
-def test_setup_grub_runs_prepare_then_install(
-    mocker, tmp_path, gpt_volume_efi_rootfs
-):
+def test_setup_grub_runs_prepare_then_install(mocker, tmp_path, gpt_volume_efi_rootfs):
     disk_path = tmp_path / "pc.img"
     disk_path.write_bytes(b"\x00" * 2048)
     image = Image(volume=gpt_volume_efi_rootfs, disk_path=disk_path)
 
-    prime_dirs = _make_prime_dirs(
-        tmp_path, "pc", gpt_volume_efi_rootfs.structure
-    )
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_efi_rootfs.structure)
 
     fake_assets = GrubAssets(
         boot_img=tmp_path / "boot.img",
@@ -570,12 +553,8 @@ def test_setup_grub_skips_install_when_prepare_returns_none(
     disk_path.write_bytes(b"\x00" * 2048)
     image = Image(volume=gpt_volume_efi_rootfs, disk_path=disk_path)
 
-    mocker.patch(
-        "imagecraft.pack.grubutil.prepare_grub_assets", return_value=None
-    )
-    mock_install = mocker.patch(
-        "imagecraft.pack.grubutil.install_grub_to_image"
-    )
+    mocker.patch("imagecraft.pack.grubutil.prepare_grub_assets", return_value=None)
+    mock_install = mocker.patch("imagecraft.pack.grubutil.install_grub_to_image")
 
     setup_grub(
         image=image,
@@ -602,8 +581,6 @@ def test_module_exports_grub_assets_and_entry_points():
 
 def test_mount_supports_bind():
     """The Mount class — unchanged in Phase B — supports --bind."""
-    m = Mount(
-        fstype=None, src="/dev", relative_mountpoint="/dev", options=["--bind"]
-    )
+    m = Mount(fstype=None, src="/dev", relative_mountpoint="/dev", options=["--bind"])
     assert m._options == ["--bind"]
     assert m._fstype is None

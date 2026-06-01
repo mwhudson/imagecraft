@@ -125,6 +125,7 @@ def _format_populate_ext_partition(
     label: str | None = None,
     offset_bytes: int = 0,
     size_bytes: int | None = None,
+    uuid: str | None = None,
 ) -> None:
     """Format a partition/device as EXT3/4 and embed content.
 
@@ -136,6 +137,8 @@ def _format_populate_ext_partition(
         the filesystem. 0 means the start of the file/device.
     :param size_bytes: Size of the filesystem to create, in bytes. When None,
         mke2fs uses the remainder of the device after ``offset_bytes``.
+    :param uuid: Filesystem UUID to assign (passed to mke2fs as ``-U``). When
+        None, mke2fs generates a random UUID.
     :raises CalledProcessError: If mke2fs fails.
     """
     mke2fs_args: list[str | Path] = ["-t", fstype]
@@ -145,6 +148,9 @@ def _format_populate_ext_partition(
 
     if label is not None:
         mke2fs_args.extend(["-L", label])
+
+    if uuid is not None:
+        mke2fs_args.extend(["-U", uuid])
 
     if offset_bytes:
         mke2fs_args.extend(["-E", f"offset={offset_bytes}"])
@@ -191,6 +197,26 @@ def _format_populate_fat_partition(  # pylint: disable=too-many-arguments
 
     if fatsize is not None:
         mkdosfs_args.extend(["-F", str(fatsize)])
+    elif offset_bytes and size_bytes is not None:
+        # When embedding a partition in a larger image file, mkfs.fat
+        # auto-selects cluster size based on the *device* size (the whole
+        # image), not the partition size we pass as the block count.  This
+        # produces a cluster size that is too large for the partition, making
+        # the cluster count fall below FAT32's minimum and causing mkfs.fat to
+        # abort.  Override with FAT32 and a cluster size derived from the
+        # actual partition size so the cluster count is always valid.
+        #
+        # Sectors-per-cluster: target ~131072 clusters (mid-range for FAT32),
+        # rounded to the nearest power of two, clamped to [1, 128].
+        total_sectors = size_bytes // sector_size
+        target_clusters = 131072
+        raw_spc = max(1, total_sectors // target_clusters)
+        # Round down to the largest power of two <= raw_spc.
+        spc = 1
+        while spc * 2 <= raw_spc:
+            spc *= 2
+        spc = min(spc, 128)
+        mkdosfs_args.extend(["-F", "32", "-s", str(spc)])
 
     if label is not None:
         mkdosfs_args.extend(["-n", label])
@@ -286,6 +312,7 @@ def format_populate_partition(
     partitionpath: Path,
     label: str | None = None,
     geometry: PartitionGeometry | None = None,
+    uuid: str | None = None,
 ) -> None:
     """Format a partition and copy files.
 
@@ -303,6 +330,9 @@ def format_populate_partition(
     :param label: Filesystem label, empty if not supplied.
     :param geometry: Optional on-disk geometry of the partition within
         ``partitionpath``.
+    :param uuid: Filesystem UUID to assign to ext partitions (passed to
+        mke2fs as ``-U``). Ignored for FAT. When None, mke2fs generates
+        a random UUID.
     """
     offset_bytes = 0
     sector_size = 512
@@ -320,6 +350,7 @@ def format_populate_partition(
             label=label,
             offset_bytes=offset_bytes,
             size_bytes=size_bytes,
+            uuid=uuid,
         )
         return
     if "fat" in fstype.value:
