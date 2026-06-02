@@ -432,6 +432,105 @@ Unicode support in FAT filenames.
 
 ---
 
+## Obstacle 7: a separate `/boot` partition breaks the prime-dir chroot
+
+_Phase: packing — inside `prepare_grub_assets` (extends obstacles 3 and
+4)._
+
+### Root cause
+
+The loop-based flow handled a dedicated `/boot` partition for free.
+`losetup --partscan` plus the per-partition `mount` calls (driven by the
+`filesystems:` mounts) reassembled the _real_ directory hierarchy —
+rootfs at `/`, boot at `/boot`, ESP at `/boot/efi` — before `update-grub`
+ran. The loop-free flow gave that up: it chroots into the rootfs
+_prime dir_, but craft's partitions feature has already routed the
+`/boot` subtree (kernels, initrds) into the **boot partition's** prime
+dir, _away_ from the rootfs prime dir. So inside the chroot:
+
+1. `/boot` is empty — `update-grub` (which globs `/boot/vmlinuz-*`, see
+   `10_linux.in`) finds no kernels and emits a menu with no entries.
+2. The kernel-listing `grub.cfg` is written to the rootfs prime dir's
+   `/boot/grub`, i.e. onto the **rootfs** partition — but the ESP stub
+   and `core.img` were told (correctly) to load it from `($root)/grub`
+   on the **boot** partition. Nothing reads it.
+3. Even with the kernels visible, `grub-mkconfig` would emit
+   `linux /boot/vmlinuz-…`. At boot `$root` is the boot partition, where
+   the kernel lives at `/vmlinuz-…` (the partition root) — so the path
+   prefix is wrong.
+
+The earlier "separate `/boot`" commit aimed the boot chain at the boot
+partition (a pre-allocated boot UUID, `($root)/grub` prefix) but did not
+address any of the three placement/visibility problems above.
+
+### Approach
+
+Reproduce what `losetup --partscan` + mount did, but unprivileged and
+pre-format. Three coordinated pieces, only active when a `filesystems:`
+entry mounts a partition at exactly `/boot`:
+
+**1. Bind-mount the boot prime dir at `/boot` (extends obstacle 3).**
+`_phase_b_chroot_mounts` prepends a `--bind` of the boot partition's
+prime dir onto `/boot` in the chroot. `update-grub` then sees the kernels
+and writes `grub.cfg` straight onto the boot partition's prime dir, where
+`mke2fs -d` picks it up for the boot partition. This fixes problems 1 and
+2.
+
+**2. Distinguish `/` from `/boot` in the `grub-probe` stub (extends
+obstacle 4).** A separate boot UUID is pre-allocated (same pattern as the
+rootfs UUID) and stamped onto the boot partition via `mke2fs -U`. The
+stub now parses the positional path (for `--target=device`) and the
+`--device` value (for `--target=fs_uuid`) so that:
+
+| query                                  | returns        |
+| -------------------------------------- | -------------- |
+| `--target=device /`                    | rootfs device  |
+| `--target=device /boot`                | boot device    |
+| `--device <rootfs> --target=fs_uuid`   | rootfs UUID    |
+| `--device <boot> --target=fs_uuid`     | boot UUID      |
+
+So `grub-mkconfig` sets `GRUB_DEVICE_BOOT_UUID` to the boot UUID and
+`10_linux` emits `search --fs-uuid <boot UUID>` per menu entry, while
+`root=UUID=<rootfs UUID>` stays on the kernel command line. When `/boot`
+is not separate the boot UUID is empty and every query collapses back to
+the rootfs values — identical to the single-partition behaviour. (Only
+the rootfs UUID still needs the `/dev/disk/by-uuid` symlink; the boot
+partition is reached via `search --fs-uuid`, which `10_linux` does not
+gate on a `by-uuid` `test -e`.)
+
+**3. Divert `grub-mkrelpath` for the path prefix (new).** The
+`/boot` vs `/vmlinuz` prefix is _not_ decided by `grub-probe`. `10_linux`
+computes it via `make_system_path_relative_to_its_root`, which
+`grub-mkconfig_lib.in` defines as a call to `grub-mkrelpath`. The real
+tool finds filesystem boundaries by comparing `st_dev` while walking up
+the tree — but our bind mount keeps `/boot` on the _same_ underlying
+filesystem as `/`, so `st_dev` never changes and the prefix would not be
+stripped. So `grub-mkrelpath` is diverted too (same `dpkg-divert`
+mechanism as `grub-probe`) with a stub that treats `/boot` as the
+filesystem root: paths under `/boot` come out boot-partition-relative
+(`/vmlinuz-…`), everything else is the identity. This is exactly what the
+real tool would emit on a genuine separate-`/boot` system, so the
+font/theme/initrd callers stay correct too.
+
+The argument forms and the kernel-path/`search` logic were checked
+against the grub2 source: `grub-mkconfig.in` (lines 135–141, the
+`grub-probe` calls), `grub-mkconfig_lib.in` (lines 33–52,
+`grub-mkrelpath` resolution and `bindir`), and `grub.d/10_linux.in`
+(lines 54–65 root-UUID gating, 132–146 the `search`/`linux` lines,
+169–212 kernel discovery and `rel_dirname`).
+
+**Trade-offs.** The `grub-mkrelpath` stub shares the fragility of the
+`grub-probe` divert (obstacle 4): it assumes `grub-mkconfig` keeps
+calling these binaries by their packaged paths. It also hard-codes the
+`/usr/bin/grub-mkrelpath` location and raises a clear error if it is
+absent, so a wrong assumption fails the build loudly rather than
+producing a silently-unbootable image. Bootability of a separate-`/boot`
+image is **not yet exercised by CI** — the spread test only greps
+`update-grub` log lines, which appear even with zero kernel entries — so
+this path still needs a real boot test.
+
+---
+
 ## Future work: supporting filesystems without offset/populate tooling
 
 The current implementation avoids loop devices entirely because ext4 and
@@ -548,9 +647,9 @@ the long-term preferred path.
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `imagecraft/plugins/mmdebstrap_plugin.py`      | Changed `--mode=root` to `--mode=unshare`                                                                                                                            |
 | `imagecraft/pack/diskutil.py`                  | Added offset/size support to `format_populate_partition` and helpers; added `uuid` parameter to `_format_populate_ext_partition`; fixed FAT32 cluster-size selection; added `_gconv_env_prefix()` for mcopy snap compatibility |
-| `imagecraft/pack/grubutil.py`                  | Replaced `grub-install` + loop-mount flow with `grub-mkimage` + prime-dir chroot; added `grub-probe` divert + stub; added UUID pre-allocation                        |
+| `imagecraft/pack/grubutil.py`                  | Replaced `grub-install` + loop-mount flow with `grub-mkimage` + prime-dir chroot; added `grub-probe` divert + stub; added UUID pre-allocation; separate-`/boot` support: boot bind-mount, `/`-vs-`/boot` stub resolution, `grub-mkrelpath` divert (obstacle 7) |
 | `imagecraft/pack/rawcontent.py`                | New module: bootloader-agnostic raw-content applier (`RawContent`, `apply_raw_content`)                                                                              |
-| `imagecraft/services/pack.py`                  | Replaced `attach_images`/loop-path flow with offset-based format loop; calls `prepare_grub_assets` + `apply_raw_content`                                             |
+| `imagecraft/services/pack.py`                  | Replaced `attach_images`/loop-path flow with offset-based format loop; calls `prepare_grub_assets` + `apply_raw_content`; detects a separate `/boot` and stamps its pre-allocated UUID at format time (obstacle 7) |
 | `imagecraft/services/lifecycle.py`             | Replaced `CRAFT_VOLUME_<NAME>` loop-path vars with `_FILE`/`_OFFSET`/`_SIZE` triples                                                                                 |
 | `imagecraft/pack/image.py`                     | Removed unreferenced loop-device machinery                                                                                                                           |
 | `tests/unit/plugins/test_mmdebstrap_plugin.py` | Updated assertion for `--mode=unshare`                                                                                                                               |
