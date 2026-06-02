@@ -334,7 +334,10 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
     assert (esp_prime / "EFI/ubuntu/shimx64.efi").read_bytes() == b"SHIMX64"
     assert (esp_prime / "EFI/ubuntu/grubx64.efi").read_bytes() == b"GRUBX64"
     assert (esp_prime / "EFI/ubuntu/grub.cfg").exists()
-    assert "configfile" in (esp_prime / "EFI/ubuntu/grub.cfg").read_text()
+    esp_grub_cfg = (esp_prime / "EFI/ubuntu/grub.cfg").read_text()
+    assert "configfile" in esp_grub_cfg
+    # The ESP stub must use the pre-allocated UUID (not a label search).
+    assert f"search.fs_uuid {result.rootfs_uuid} root" in esp_grub_cfg
 
     # Chroot must have been constructed with the rootfs prime dir as
     # its path (Phase-B: no image partition mount, no loop device).
