@@ -14,6 +14,7 @@
 
 """Unit tests for the Phase-B (no-loop, no-image-mount) grub setup."""
 
+import subprocess
 import uuid as uuid_mod
 from pathlib import Path
 
@@ -27,7 +28,10 @@ from imagecraft.models.volume import (
 from imagecraft.pack import grubutil
 from imagecraft.pack.chroot import Mount
 from imagecraft.pack.grubutil import (
+    _GRUB_MKRELPATH_STUB,
+    _GRUB_PROBE_STUB,
     GrubAssets,
+    _ensure_chroot_mountpoints,
     _phase_b_chroot_mounts,
     grub_raw_content,
     install_grub_to_image,
@@ -198,6 +202,39 @@ def test_phase_b_chroot_mounts_has_no_devtmpfs():
     assert "devtmpfs" not in fstypes
 
 
+def test_phase_b_chroot_mounts_no_boot_bind_by_default():
+    """Without a separate /boot, no /boot bind mount is staged."""
+    mounts = _phase_b_chroot_mounts()
+    assert not [m for m in mounts if m._relative_mountpoint == "/boot"]
+
+
+def test_phase_b_chroot_mounts_binds_separate_boot(tmp_path):
+    """A separate boot prime dir is bind-mounted at /boot, before /dev."""
+    boot_prime = tmp_path / "boot-prime"
+    mounts = _phase_b_chroot_mounts(boot_prime=boot_prime)
+
+    boot_mounts = [m for m in mounts if m._relative_mountpoint == "/boot"]
+    assert len(boot_mounts) == 1
+    boot = boot_mounts[0]
+    assert boot._fstype is None
+    assert boot._src == str(boot_prime)
+    assert boot._options == ["--bind"]
+    # /boot must be mounted first so it is unmounted last (after /dev et al.).
+    assert mounts[0] is boot
+
+
+def test_ensure_chroot_mountpoints_creates_boot_when_requested(tmp_path):
+    """``mount_boot`` makes /boot exist so the bind mount has a target."""
+    _ensure_chroot_mountpoints(tmp_path, mount_boot=True)
+    assert (tmp_path / "boot").is_dir()
+
+
+def test_ensure_chroot_mountpoints_no_boot_by_default(tmp_path):
+    """Without ``mount_boot`` we do not create /boot."""
+    _ensure_chroot_mountpoints(tmp_path)
+    assert not (tmp_path / "boot").exists()
+
+
 # ── prepare_grub_assets: skip cases ───────────────────────────────────────────
 
 
@@ -294,7 +331,9 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
     # /tmp/imagecraft-core.img inside the chroot (which IS rootfs_prime).
     (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+    def fake_execute(
+        *, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix, boot_uuid
+    ):
         # rootfs_uuid must be a valid UUID string.
         uuid_mod.UUID(rootfs_uuid)
         # Reproduce what _build_grub_in_chroot would create.
@@ -305,8 +344,9 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
         (rootfs_prime / "boot" / "grub" / "grub.cfg").write_text("menuentry...")
         # Sanity: core_prefix should point at the rootfs partition.
         assert "gpt2" in core_prefix
-        # No separate /boot: search_uuid == rootfs_uuid
+        # No separate /boot: search_uuid == rootfs_uuid, no boot UUID.
         assert search_uuid == rootfs_uuid
+        assert boot_uuid is None
         assert grub_prefix == "($root)/boot/grub"
 
     mock_chroot_cls = mocker.patch("imagecraft.pack.grubutil.Chroot")
@@ -361,7 +401,9 @@ def test_prepare_grub_assets_amd64_gpt_with_bios_boot(
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+    def fake_execute(
+        *, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix, boot_uuid
+    ):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # rootfs is the third partition in this layout (bios-boot, efi,
@@ -389,7 +431,9 @@ def test_prepare_grub_assets_amd64_mbr(mocker, tmp_path, mbr_volume_boot_rootfs)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+    def fake_execute(
+        *, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix, boot_uuid
+    ):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # MBR prefix uses msdos<N>, not gpt<N>.
@@ -425,7 +469,9 @@ def test_prepare_grub_assets_missing_shim_raises(
     bios_dir.mkdir(parents=True, exist_ok=True)
     (bios_dir / "boot.img").write_bytes(b"X" * 512)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+    def fake_execute(
+        *, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix, boot_uuid
+    ):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
 
@@ -640,11 +686,16 @@ def test_prepare_grub_assets_separate_boot_partition(
     _populate_rootfs_with_grub_files(rootfs_prime)
     (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+    def fake_execute(
+        *, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix, boot_uuid
+    ):
         uuid_mod.UUID(rootfs_uuid)
         uuid_mod.UUID(search_uuid)
         # search_uuid must differ from rootfs_uuid (it's the boot UUID)
         assert search_uuid != rootfs_uuid
+        # the boot UUID is passed through for the grub-probe stub and equals
+        # the search UUID for a separate /boot.
+        assert boot_uuid == search_uuid
         # prefix points at boot partition (gpt2) with /grub path
         assert core_prefix == "(,gpt2)/grub"
         assert grub_prefix == "($root)/grub"
@@ -678,3 +729,83 @@ def test_prepare_grub_assets_separate_boot_partition(
     # Should NOT reference rootfs UUID or /boot/grub in the stub.
     assert result.rootfs_uuid not in esp_grub_cfg
     assert "/boot/grub" not in esp_grub_cfg
+
+
+# ── grub-probe / grub-mkrelpath stubs (executed as real shell scripts) ────────
+
+
+ROOTFS_UUID = "11111111-1111-1111-1111-111111111111"
+BOOT_UUID = "22222222-2222-2222-2222-222222222222"
+
+
+def _run_probe_stub(tmp_path, boot_uuid, *args):
+    """Materialise and run the grub-probe stub, returning its stdout."""
+    script = tmp_path / "grub-probe"
+    script.write_text(
+        _GRUB_PROBE_STUB.replace("@@ROOTFS_UUID@@", ROOTFS_UUID).replace(
+            "@@BOOT_UUID@@", boot_uuid
+        )
+    )
+    script.chmod(0o755)
+    return subprocess.run(
+        ["sh", str(script), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_probe_stub_single_partition_collapses_to_rootfs(tmp_path):
+    """With no boot UUID, / and /boot both resolve to the rootfs."""
+    run = lambda *a: _run_probe_stub(tmp_path, "", *a)  # noqa: E731
+    assert run("--target=device", "/") == "/dev/sda2"
+    # /boot collapses to the rootfs device when /boot is not separate.
+    assert run("--target=device", "/boot") == "/dev/sda2"
+    assert run("--device", "/dev/sda2", "--target=fs_uuid") == ROOTFS_UUID
+    # Even a /boot device query yields the rootfs UUID in this mode.
+    assert run("--device", "/dev/sda1", "--target=fs_uuid") == ROOTFS_UUID
+
+
+def test_probe_stub_separate_boot_resolves_distinct_devices(tmp_path):
+    """With a boot UUID, / and /boot resolve to distinct devices/UUIDs."""
+    run = lambda *a: _run_probe_stub(tmp_path, BOOT_UUID, *a)  # noqa: E731
+    assert run("--target=device", "/") == "/dev/sda2"
+    assert run("--target=device", "/boot") == "/dev/sda1"
+    assert run("--target=device", "/boot/grub") == "/dev/sda1"
+    # fs_uuid keyed on the device passed back by 10_linux.
+    assert run("--device", "/dev/sda2", "--target=fs_uuid") == ROOTFS_UUID
+    assert run("--device", "/dev/sda1", "--target=fs_uuid") == BOOT_UUID
+
+
+def test_probe_stub_short_flags(tmp_path):
+    """Short ``-t``/``-d`` forms behave like their long equivalents."""
+    run = lambda *a: _run_probe_stub(tmp_path, BOOT_UUID, *a)  # noqa: E731
+    assert run("-t", "device", "/boot") == "/dev/sda1"
+    assert run("-d", "-t", "fs_uuid", "/dev/sda1") == BOOT_UUID
+    assert run("-d", "-t", "fs_uuid", "/dev/sda2") == ROOTFS_UUID
+
+
+def _run_mkrelpath_stub(tmp_path, *args):
+    """Materialise and run the grub-mkrelpath stub, returning its stdout."""
+    script = tmp_path / "grub-mkrelpath"
+    script.write_text(_GRUB_MKRELPATH_STUB)
+    script.chmod(0o755)
+    return subprocess.run(
+        ["sh", str(script), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_mkrelpath_stub_strips_boot_prefix(tmp_path):
+    """Paths under /boot become boot-partition-relative; others unchanged."""
+    assert _run_mkrelpath_stub(tmp_path, "/boot") == ""
+    assert _run_mkrelpath_stub(tmp_path, "/boot/vmlinuz-6.8.0-1") == "/vmlinuz-6.8.0-1"
+    assert _run_mkrelpath_stub(tmp_path, "/boot/grub") == "/grub"
+    # Not under /boot: identity (matches the real tool in a single-fs chroot).
+    assert _run_mkrelpath_stub(tmp_path, "/usr/share/grub/x.pf2") == (
+        "/usr/share/grub/x.pf2"
+    )
+    # Flags are ignored; the path is still resolved.
+    assert _run_mkrelpath_stub(tmp_path, "-r", "/boot/initrd.img") == "/initrd.img"

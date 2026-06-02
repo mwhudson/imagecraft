@@ -134,9 +134,21 @@ _GRUB_PROBE_PATH = "/usr/sbin/grub-probe"
 # the chroot.  grub-mkconfig calls grub-probe to discover the block device and
 # UUID for / and /boot; in an unprivileged container the real grub-probe fails
 # because the rootfs lives on the host's ZFS pool whose vdevs are not exposed
-# in the container's /dev.  The stub returns fixed values derived from the UUID
-# that imagecraft will later pass to mke2fs -U, so the generated grub.cfg
-# references the correct UUID from the start.
+# in the container's /dev.  The stub returns fixed values derived from the
+# UUIDs that imagecraft will later pass to mke2fs -U, so the generated grub.cfg
+# references the correct UUIDs from the start.
+#
+# When /boot is a separate partition, ``/`` and ``/boot`` must resolve to
+# *different* devices and UUIDs so that grub-mkconfig emits a
+# ``search --fs-uuid <boot UUID>`` for the boot partition in each menu entry
+# (while keeping ``root=UUID=<rootfs UUID>`` on the kernel command line).  The
+# stub distinguishes them by the path argument (for ``--target=device``) and by
+# the ``--device`` value (for ``--target=fs_uuid``).  @@BOOT_UUID@@ is empty
+# when /boot is not separate, in which case every query collapses back to the
+# rootfs device/UUID — exactly the previous single-partition behaviour.
+#
+# Note: the *path prefix* of kernels (``/vmlinuz`` vs ``/boot/vmlinuz``) is
+# decided by grub-mkrelpath, not grub-probe — see _GRUB_MKRELPATH_STUB.
 #
 # Argument forms handled (as produced by grub-mkconfig.in and
 # grub-mkconfig_lib.in):
@@ -147,11 +159,15 @@ _GRUB_PROBE_STUB = """\
 #!/bin/sh
 # Imagecraft grub-probe stub — removed after update-grub completes.
 ROOTFS_UUID=@@ROOTFS_UUID@@
-FAKE_DEVICE=/dev/sda1
+BOOT_UUID=@@BOOT_UUID@@
+ROOTFS_DEV=/dev/sda2
+BOOT_DEV=/dev/sda1
 FAKE_FS=ext4
 FAKE_PARTMAP=gpt
 
 target=""
+is_device=false
+posarg=""
 next_is_target=false
 for arg in "$@"; do
     if $next_is_target; then
@@ -160,14 +176,33 @@ for arg in "$@"; do
         continue
     fi
     case "$arg" in
-        --target=*) target="${arg#--target=}" ;;
-        -t)         next_is_target=true ;;
+        --target=*)  target="${arg#--target=}" ;;
+        -t)          next_is_target=true ;;
+        --device|-d) is_device=true ;;
+        -*)          ;;
+        *)           posarg="$arg" ;;
     esac
 done
 
+# Resolve the positional argument to a (device, uuid) pair.  Default to the
+# rootfs; only divert to the boot partition when /boot is separate.
+dev="$ROOTFS_DEV"
+uuid="$ROOTFS_UUID"
+if [ -n "$BOOT_UUID" ]; then
+    if $is_device; then
+        # --target=fs_uuid form: posarg is a device name.
+        [ "$posarg" = "$BOOT_DEV" ] && { dev="$BOOT_DEV"; uuid="$BOOT_UUID"; }
+    else
+        # --target=device form: posarg is a path.
+        case "$posarg" in
+            /boot|/boot/*) dev="$BOOT_DEV"; uuid="$BOOT_UUID" ;;
+        esac
+    fi
+fi
+
 case "$target" in
-    device)             echo "$FAKE_DEVICE" ;;
-    fs_uuid)            echo "$ROOTFS_UUID" ;;
+    device)             echo "$dev" ;;
+    fs_uuid)            echo "$uuid" ;;
     partuuid)           echo "" ;;
     fs)                 echo "$FAKE_FS" ;;
     partmap)            echo "$FAKE_PARTMAP" ;;
@@ -178,6 +213,39 @@ case "$target" in
     hints_string)       echo "" ;;
     cryptodisk_uuid)    echo "" ;;
     *)                  echo "" ;;
+esac
+exit 0
+"""
+
+_GRUB_MKRELPATH_PATH = "/usr/bin/grub-mkrelpath"
+
+# Shell script written over the real grub-mkrelpath when /boot is a separate
+# partition.  grub-mkconfig's make_system_path_relative_to_its_root() calls
+# grub-mkrelpath to turn an absolute path (e.g. the kernel directory /boot)
+# into a path relative to the filesystem that holds it.  The real tool finds
+# filesystem boundaries by comparing st_dev while walking up the tree — but in
+# our chroot the boot prime dir is bind-mounted at /boot from the *same*
+# underlying filesystem as /, so st_dev never changes and the real tool would
+# keep the /boot prefix (yielding ``/boot/vmlinuz``).  At boot, $root is the
+# boot partition, so kernel paths must be boot-partition-relative
+# (``/vmlinuz``).  This stub forces that by treating /boot as the filesystem
+# root.  It is only installed when /boot is separate; for every other path it
+# is the identity, matching the real tool's behaviour in a single-filesystem
+# chroot.
+_GRUB_MKRELPATH_STUB = """\
+#!/bin/sh
+# Imagecraft grub-mkrelpath stub — removed after update-grub completes.
+path=""
+for arg in "$@"; do
+    case "$arg" in
+        -*) ;;
+        *)  path="$arg" ;;
+    esac
+done
+case "$path" in
+    /boot)   echo "" ;;
+    /boot/*) echo "${path#/boot}" ;;
+    *)       echo "$path" ;;
 esac
 exit 0
 """
@@ -269,7 +337,7 @@ def setup_grub(
         install_grub_to_image(image=image, assets=assets)
 
 
-def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherently branchy
+def prepare_grub_assets(  # noqa: PLR0912, PLR0915 — phase-B orchestration is inherently branchy
     *,
     arch: str,
     volume_name: str,
@@ -335,11 +403,21 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
     if schema == PartitionSchema.GPT:
         bios_boot_struct = _find_bios_boot_structure(volume)
 
+    # If /boot is a separate partition, its content (kernels, initrds) was
+    # routed by craft into the boot partition's prime dir, away from the
+    # rootfs prime dir we chroot into. Bind-mount it back at /boot so
+    # update-grub can see the kernels and writes grub.cfg straight onto the
+    # boot partition's prime dir (where the bootloader looks for it).
+    separate_boot = boot_partition_name is not None
+    separate_boot_prime: Path | None = None
+    if separate_boot:
+        separate_boot_prime = prime_dirs[f"volume/{volume_name}/{boot_partition_name}"]
+
     # Stage the chroot mount points. We chroot directly into the rootfs
     # prime dir — no image partition mounts. /dev is a --bind (not
     # devtmpfs) so unprivileged user namespaces work.
-    _ensure_chroot_mountpoints(rootfs_prime)
-    mounts = _phase_b_chroot_mounts()
+    _ensure_chroot_mountpoints(rootfs_prime, mount_boot=separate_boot)
+    mounts = _phase_b_chroot_mounts(boot_prime=separate_boot_prime)
     chroot = Chroot(path=rootfs_prime, mounts=mounts)
 
     workdir.mkdir(parents=True, exist_ok=True)
@@ -355,7 +433,6 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
     # The ESP stub and core.img early config will search for the boot
     # partition (where /grub/grub.cfg lives) instead of rootfs.
     boot_uuid: str | None = None
-    separate_boot = boot_partition_name is not None
     if separate_boot:
         boot_uuid = str(_uuid_mod.uuid4())
 
@@ -386,6 +463,7 @@ def prepare_grub_assets(  # noqa: PLR0912 — phase-B orchestration is inherentl
             rootfs_uuid=rootfs_uuid,
             search_uuid=boot_uuid if separate_boot else rootfs_uuid,
             grub_prefix="($root)/grub" if separate_boot else "($root)/boot/grub",
+            boot_uuid=boot_uuid,
         )
     except errors.ChrootMountError as err:
         emit.progress(f"Cannot install GRUB on this rootfs: {err}", permanent=True)
@@ -550,50 +628,75 @@ def _partition_number(volume: "Volume", target: StructureItem) -> int:
     raise errors.ImageError(f"Cannot determine partition number for {target.name!r}")
 
 
-def _ensure_chroot_mountpoints(rootfs_prime: Path) -> None:
+def _ensure_chroot_mountpoints(rootfs_prime: Path, *, mount_boot: bool = False) -> None:
     """Make sure /dev, /proc, /sys, /run, /dev/pts exist under the rootfs.
 
     A properly-built mmdebstrap rootfs will already have these, but
     create them defensively so the chroot mount step doesn't fail on a
-    bare directory.
+    bare directory.  When ``mount_boot`` is set, /boot is created too so the
+    separate boot partition's prime dir can be bind-mounted onto it.
     """
-    for sub in ("dev", "proc", "sys", "run", "dev/pts"):
+    subdirs = ["dev", "proc", "sys", "run", "dev/pts"]
+    if mount_boot:
+        subdirs.append("boot")
+    for sub in subdirs:
         (rootfs_prime / sub).mkdir(parents=True, exist_ok=True)
 
 
-def _phase_b_chroot_mounts() -> list[Mount]:
+def _phase_b_chroot_mounts(*, boot_prime: Path | None = None) -> list[Mount]:
     """Mounts for the in-rootfs grub work.
 
     Key difference vs the legacy flow: /dev is a ``--bind`` of the host
     ``/dev`` (LXD pre-populates it) instead of ``-t devtmpfs``. devtmpfs
     is blocked in non-init user namespaces by the kernel.
+
+    When ``boot_prime`` is given (a separate /boot partition), it is
+    bind-mounted at /boot so update-grub sees the kernels that craft routed
+    onto the boot partition and writes grub.cfg straight onto it.
     """
-    return [
-        Mount(
-            fstype=None,
-            src="/dev",
-            relative_mountpoint="/dev",
-            options=["--bind"],
-        ),
-        Mount(
-            fstype="devpts",
-            src="devpts-build",
-            relative_mountpoint="/dev/pts",
-            options=["-o", "nodev,nosuid"],
-        ),
-        Mount(fstype="proc", src="proc-build", relative_mountpoint="proc"),
-        Mount(fstype="sysfs", src="sysfs-build", relative_mountpoint="/sys"),
-        Mount(
-            fstype=None,
-            src="/run",
-            relative_mountpoint="/run",
-            options=["--bind"],
-        ),
-    ]
+    mounts: list[Mount] = []
+    if boot_prime is not None:
+        mounts.append(
+            Mount(
+                fstype=None,
+                src=str(boot_prime),
+                relative_mountpoint="/boot",
+                options=["--bind"],
+            )
+        )
+    mounts.extend(
+        [
+            Mount(
+                fstype=None,
+                src="/dev",
+                relative_mountpoint="/dev",
+                options=["--bind"],
+            ),
+            Mount(
+                fstype="devpts",
+                src="devpts-build",
+                relative_mountpoint="/dev/pts",
+                options=["-o", "nodev,nosuid"],
+            ),
+            Mount(fstype="proc", src="proc-build", relative_mountpoint="proc"),
+            Mount(fstype="sysfs", src="sysfs-build", relative_mountpoint="/sys"),
+            Mount(
+                fstype=None,
+                src="/run",
+                relative_mountpoint="/run",
+                options=["--bind"],
+            ),
+        ]
+    )
+    return mounts
 
 
 def _build_grub_in_chroot(
-    core_prefix: str, rootfs_uuid: str, search_uuid: str, grub_prefix: str
+    core_prefix: str,
+    rootfs_uuid: str,
+    search_uuid: str,
+    grub_prefix: str,
+    boot_uuid: str | None = None,
 ) -> None:
     """Run inside the rootfs chroot: update-grub + grub-mkimage.
 
@@ -610,10 +713,19 @@ def _build_grub_in_chroot(
     It is injected into a grub-probe stub so that ``grub-mkconfig``
     generates a ``grub.cfg`` referencing this UUID, which mke2fs will
     later be asked to stamp onto the filesystem with ``-U``.
+
+    ``boot_uuid`` is the UUID pre-allocated for a *separate* /boot
+    partition, or ``None`` when /boot lives on the rootfs.  When set, the
+    grub-probe stub resolves /boot to that UUID (so menu entries
+    ``search`` for the boot partition) and grub-mkrelpath is diverted so
+    kernel paths are boot-partition-relative.
     """
-    # update-grub writes /boot/grub/grub.cfg by scanning /boot for
-    # kernels. We keep the os-prober diversion from the legacy flow so
-    # the chroot doesn't pick up the host's other operating systems.
+    separate_boot = boot_uuid is not None
+
+    # update-grub writes the kernel-listing grub.cfg by scanning /boot for
+    # kernels (which lands on the boot partition's prime dir when /boot is
+    # bind-mounted there). We keep the os-prober diversion from the legacy
+    # flow so the chroot doesn't pick up the host's other operating systems.
     os_prober_divert_args = [
         "--local",
         "--divert",
@@ -627,6 +739,13 @@ def _build_grub_in_chroot(
         _GRUB_PROBE_PATH + ".dpkg-divert",
         "--rename",
         _GRUB_PROBE_PATH,
+    ]
+    grub_mkrelpath_divert_args = [
+        "--local",
+        "--divert",
+        _GRUB_MKRELPATH_PATH + ".dpkg-divert",
+        "--rename",
+        _GRUB_MKRELPATH_PATH,
     ]
 
     try:
@@ -646,13 +765,31 @@ def _build_grub_in_chroot(
     # root is not exposed in the container's /dev.
     run("dpkg-divert", *grub_probe_divert_args, stderr=subprocess.STDOUT)
     Path(_GRUB_PROBE_PATH).write_text(
-        _GRUB_PROBE_STUB.replace("@@ROOTFS_UUID@@", rootfs_uuid)
+        _GRUB_PROBE_STUB.replace("@@ROOTFS_UUID@@", rootfs_uuid).replace(
+            "@@BOOT_UUID@@", boot_uuid or ""
+        )
     )
     Path(_GRUB_PROBE_PATH).chmod(0o755)
+    # When /boot is a separate partition, also divert grub-mkrelpath so the
+    # generated grub.cfg uses boot-partition-relative kernel paths
+    # (``/vmlinuz``, not ``/boot/vmlinuz``).  The same-filesystem bind mount
+    # at /boot is invisible to the real tool's st_dev-based detection.
+    if separate_boot:
+        if not Path(_GRUB_MKRELPATH_PATH).is_file():
+            raise errors.GRUBInstallError(
+                f"grub-mkrelpath not found at {_GRUB_MKRELPATH_PATH}; cannot "
+                "generate boot-partition-relative kernel paths for a separate "
+                "/boot partition."
+            )
+        run("dpkg-divert", *grub_mkrelpath_divert_args, stderr=subprocess.STDOUT)
+        Path(_GRUB_MKRELPATH_PATH).write_text(_GRUB_MKRELPATH_STUB)
+        Path(_GRUB_MKRELPATH_PATH).chmod(0o755)
     # 10_linux.in checks ``test -e /dev/disk/by-uuid/$GRUB_DEVICE_UUID``
     # to decide whether to use ``root=UUID=...`` or fall back to the raw
     # device name.  Create a symlink so the check passes and the
     # generated grub.cfg uses the UUID (which matches what mke2fs gets).
+    # Only the rootfs UUID is gated this way (it's the kernel's root=); the
+    # boot partition is found via ``search --fs-uuid`` with no such check.
     by_uuid_link = Path("/dev/disk/by-uuid") / rootfs_uuid
     by_uuid_link.parent.mkdir(parents=True, exist_ok=True)
     by_uuid_link.symlink_to("/dev/null")
@@ -672,6 +809,14 @@ def _build_grub_in_chroot(
             *grub_probe_divert_args,
             stderr=subprocess.STDOUT,
         )
+        if separate_boot:
+            Path(_GRUB_MKRELPATH_PATH).unlink(missing_ok=True)
+            run(
+                "dpkg-divert",
+                "--remove",
+                *grub_mkrelpath_divert_args,
+                stderr=subprocess.STDOUT,
+            )
         run(
             "dpkg-divert",
             "--remove",
