@@ -15,6 +15,8 @@
 """Disk-related utility functions."""
 
 import json
+import os
+import platform
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,42 @@ from imagecraft.subprocesses import run
 
 FatT = Literal["fat", "vfat"]
 ExtT = Literal["ext3", "ext4"]
+
+
+def _gconv_env_prefix() -> str:
+    """Return a shell variable prefix that ensures gconv modules are found.
+
+    When imagecraft runs as a snap the bundled mcopy uses the base snap's glibc
+    but glibc loads gconv modules (e.g. IBM850.so for FAT codepage support) via
+    dlopen using a compiled-in path.  On a host with a newer glibc the modules
+    at that path are ABI-incompatible, causing iconv_open to fail.
+
+    Setting GCONV_PATH to the base snap's own gconv directory forces glibc to
+    use the matching modules.  Outside a snap the variable is harmless — glibc
+    already finds modules at the default path.
+    """
+    snap = os.environ.get("SNAP")
+    if not snap:
+        return ""
+
+    # Determine the multiarch triplet for the running architecture.
+    _triplet_map = {
+        "x86_64": "x86_64-linux-gnu",
+        "aarch64": "aarch64-linux-gnu",
+        "armv7l": "arm-linux-gnueabihf",
+        "riscv64": "riscv64-linux-gnu",
+        "s390x": "s390x-linux-gnu",
+        "ppc64le": "powerpc64le-linux-gnu",
+    }
+    machine = platform.machine()
+    triplet = _triplet_map.get(machine, f"{machine}-linux-gnu")
+
+    # core24 base snap provides the glibc matching the snap's staged binaries.
+    gconv_dir = Path(f"/snap/core24/current/usr/lib/{triplet}/gconv")
+    if gconv_dir.is_dir():
+        return f"GCONV_PATH={gconv_dir} "
+
+    return ""
 
 
 # Conversion functions
@@ -247,7 +285,8 @@ def _format_populate_fat_partition(  # pylint: disable=too-many-arguments
         image_arg = str(partitionpath)
         if offset_bytes:
             image_arg = f"{image_arg}@@{offset_bytes}"
-        mcopy_cmd = f"LC_ALL=C mcopy -n -o -s -i{image_arg} {content_dir}/* ::"
+        gconv = _gconv_env_prefix()
+        mcopy_cmd = f"{gconv}LC_ALL=C mcopy -n -o -s -i{image_arg} {content_dir}/* ::"
         with emit.open_stream("Copying files to partition") as stream:
             run("bash", "-c", mcopy_cmd, stdout=stream, stderr=stream)
 

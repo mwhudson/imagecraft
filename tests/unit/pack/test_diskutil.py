@@ -449,3 +449,50 @@ def test_get_partition_geometry_missing(mocker, tmp_path):
 
     with pytest.raises(CraftError, match="No partition numbered 9"):
         diskutil.get_partition_geometry(image_path, 9)
+
+
+class TestGconvEnvPrefix:
+    """Tests for _gconv_env_prefix()."""
+
+    def test_no_snap_returns_empty(self, monkeypatch):
+        monkeypatch.delenv("SNAP", raising=False)
+        assert diskutil._gconv_env_prefix() == ""
+
+    def test_snap_with_existing_gconv_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SNAP", "/snap/imagecraft/42")
+        # Create a fake gconv directory at the path the function will check.
+        from pathlib import Path as _Path
+        from unittest.mock import patch
+
+        machine = __import__("platform").machine()
+        triplet_map = {
+            "x86_64": "x86_64-linux-gnu",
+            "aarch64": "aarch64-linux-gnu",
+            "armv7l": "arm-linux-gnueabihf",
+            "riscv64": "riscv64-linux-gnu",
+            "s390x": "s390x-linux-gnu",
+            "ppc64le": "powerpc64le-linux-gnu",
+        }
+        triplet = triplet_map.get(machine, f"{machine}-linux-gnu")
+        fake_gconv = tmp_path / "snap" / "core24" / "current" / "usr" / "lib" / triplet / "gconv"
+        fake_gconv.mkdir(parents=True)
+
+        # Patch Path so the is_dir() check sees our fake directory.
+        real_path = _Path
+
+        def fake_path_factory(p):
+            s = str(p)
+            if "/snap/core24/current/" in s:
+                return real_path(str(tmp_path) + s)
+            return real_path(s)
+
+        with patch("imagecraft.pack.diskutil.Path", side_effect=fake_path_factory):
+            result = diskutil._gconv_env_prefix()
+        assert result.startswith("GCONV_PATH=")
+        assert "gconv" in result
+        assert result.endswith(" ")
+
+    def test_snap_without_gconv_dir(self, monkeypatch):
+        monkeypatch.setenv("SNAP", "/snap/imagecraft/42")
+        # /snap/core24/current/... won't exist in test env
+        assert diskutil._gconv_env_prefix() == ""
