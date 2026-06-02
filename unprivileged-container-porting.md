@@ -389,12 +389,55 @@ auto-selection is skipped entirely and the original behaviour is preserved.
 
 ---
 
+## Obstacle 6: mcopy fails with "plain langstrstrncasecmp" on resolute hosts
+
+_Phase: pack — copying files into FAT partition._
+
+**Root cause.** The imagecraft snap is built with `base: core24` (glibc
+2.39). Its bundled `mcopy` is patchelf'd to use that glibc at runtime.
+However, glibc loads character-set conversion modules (gconv) via
+`dlopen` using a compiled-in search path that still resolves to the
+**host** system's gconv directory (`/usr/lib/<triplet>/gconv`). On a
+resolute host (glibc 2.41) the host's `IBM850.so` is ABI-incompatible
+with core24's glibc 2.39, causing `iconv_open("WCHAR_T", "CP850")` to
+return -1 with `errno=EINVAL`. mcopy then falls back to `langstrstrncasecmp`
+which produces garbled behaviour or failures.
+
+**Diagnosis.**
+- `LD_DEBUG=all` trace showed `dlopen` of IBM850.so from the host path.
+- Python on the same system (using host glibc 2.41) could successfully
+  `iconv_open` all codepages — confirming the issue is ABI mismatch, not
+  a missing module.
+- Setting `GCONV_PATH=/snap/core24/current/usr/lib/x86_64-linux-gnu/gconv`
+  before invoking mcopy resolved the issue immediately.
+
+**Fix.** Added `_gconv_env_prefix()` helper in `diskutil.py`. When
+`$SNAP` is set (i.e., running as a snap), it computes the architecture-
+appropriate gconv directory inside the core24 base snap and returns a
+`GCONV_PATH=<dir> ` shell prefix. This is prepended to the mcopy
+command string (alongside the existing `LC_ALL=C` prefix).
+
+The helper:
+1. Checks `os.environ.get("SNAP")` — returns `""` if not running as a snap.
+2. Maps `platform.machine()` to the multiarch triplet.
+3. Verifies the gconv directory exists (`.is_dir()`); returns `""` if not.
+
+**Trade-offs.** The fix is specific to core24-based snaps. If the base
+snap changes (e.g., core26), the gconv path changes too. The function
+uses `/snap/core24/current/` which tracks the latest revision of core24.
+A future migration to a different base would require updating the path.
+An alternative approach (compiling mtools without `HAVE_ICONV_H` to use
+built-in codepage tables) avoids the issue entirely but loses proper
+Unicode support in FAT filenames.
+
+---
+
 ## Summary of changed files
 
 | File                                           | What changed                                                                                                                                                         |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `imagecraft/plugins/mmdebstrap_plugin.py`      | Changed `--mode=root` to `--mode=unshare`                                                                                                                            |
-| `imagecraft/pack/diskutil.py`                  | Added offset/size support to `format_populate_partition` and helpers; added `uuid` parameter to `_format_populate_ext_partition`; fixed FAT32 cluster-size selection |
+| `imagecraft/pack/diskutil.py`                  | Added offset/size support to `format_populate_partition` and helpers; added `uuid` parameter to `_format_populate_ext_partition`; fixed FAT32 cluster-size selection; added `_gconv_env_prefix()` for mcopy snap compatibility |
 | `imagecraft/pack/grubutil.py`                  | Replaced `grub-install` + loop-mount flow with `grub-mkimage` + prime-dir chroot; added `grub-probe` divert + stub; added UUID pre-allocation                        |
 | `imagecraft/pack/rawcontent.py`                | New module: bootloader-agnostic raw-content applier (`RawContent`, `apply_raw_content`)                                                                              |
 | `imagecraft/services/pack.py`                  | Replaced `attach_images`/loop-path flow with offset-based format loop; calls `prepare_grub_assets` + `apply_raw_content`                                             |
@@ -402,7 +445,7 @@ auto-selection is skipped entirely and the original behaviour is preserved.
 | `imagecraft/pack/image.py`                     | Removed unreferenced loop-device machinery                                                                                                                           |
 | `tests/unit/plugins/test_mmdebstrap_plugin.py` | Updated assertion for `--mode=unshare`                                                                                                                               |
 | `tests/unit/pack/test_grubutil.py`             | Fully rewritten for the new flow                                                                                                                                     |
-| `tests/unit/pack/test_diskutil.py`             | Added tests for offset/uuid/FAT32 paths                                                                                                                              |
+| `tests/unit/pack/test_diskutil.py`             | Added tests for offset/uuid/FAT32 paths; added tests for `_gconv_env_prefix()`                                                                                       |
 | `tests/unit/pack/test_rawcontent.py`           | New: tests for the generic applier                                                                                                                                   |
 | `tests/unit/services/test_pack.py`             | Updated for new pack-service call sequence                                                                                                                           |
 | `tests/unit/services/test_lifecycle.py`        | Updated for new env-var shape                                                                                                                                        |
