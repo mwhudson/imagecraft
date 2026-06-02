@@ -432,6 +432,116 @@ Unicode support in FAT filenames.
 
 ---
 
+## Future work: supporting filesystems without offset/populate tooling
+
+The current implementation avoids loop devices entirely because ext4 and
+FAT both have tools that support direct-to-image operations:
+
+| Filesystem | Create at offset | Populate without mounting |
+| ---------- | ---------------- | ------------------------ |
+| ext4       | `mke2fs -E offset=` | `mke2fs -d <dir>` |
+| FAT/vfat   | `mkfs.fat --offset` | `mcopy -i <file>@@<offset>` |
+
+If a new filesystem type is needed (e.g. XFS, btrfs, f2fs) that lacks
+these capabilities, the container would need access to a block device in
+order to run `mkfs` + `mount` + copy + `umount`. Since block device
+access (loop devices) requires host privilege, a **host-side daemon**
+would be needed to provide that plumbing.
+
+### Design constraint
+
+The daemon must **not** run filesystem tools itself. The container holds
+the correct mkfs/mount implementations for the target release (e.g.
+noble's `mkfs.xfs` may produce different on-disk features than
+resolute's). Delegating mkfs to the host would silently use the wrong
+tool version. The daemon's responsibility is limited to privileged
+plumbing — it is a "loop device vending machine."
+
+### Interaction sketch
+
+```
+Container (correct tools)               Host daemon (has privilege)
+─────────────────────────               ──────────────────────────────
+
+1. Request:
+   "attach <image-path>
+    offset=<bytes>
+    sizelimit=<bytes>"          ──────►
+
+                                        2. losetup --offset <off> \
+                                             --sizelimit <size> \
+                                             --find --show <image-path>
+                                           → /dev/loop7
+
+                                        3. lxc config device add <ctr> loop7 \
+                                             unix-block source=/dev/loop7 \
+                                             path=/dev/loop7
+                                           (also adds cgroup device allow)
+
+                                ◄────── 4. Response: "/dev/loop7"
+
+5. mkfs.xfs /dev/loop7          ← container's own mkfs (target release)
+6. mount /dev/loop7 /mnt         ← allowed via security.syscalls.intercept.mount
+7. cp -a <content>/* /mnt/
+8. umount /mnt
+
+9. Request: "detach /dev/loop7"  ──────►
+
+                                       10. lxc config device remove <ctr> loop7
+                                       11. losetup -d /dev/loop7
+
+                                ◄────── 12. Response: "ok"
+```
+
+### LXD host configuration required
+
+```yaml
+# Allow the container to mount the injected block device.
+config:
+  security.syscalls.intercept.mount: "true"
+  security.syscalls.intercept.mount.allowed: xfs
+```
+
+The container itself never touches `/dev/loop-control` or calls
+`losetup`. It only sees a pre-attached block device that appears and
+disappears on demand.
+
+### Communication channel
+
+The daemon could listen on a Unix socket bind-mounted into the container
+(e.g. `/run/imagecraft-loopd.sock`). The protocol is trivial:
+
+| Request | Parameters | Response |
+| ------- | ---------- | -------- |
+| `attach` | `image=<path>`, `offset=<bytes>`, `sizelimit=<bytes>` | `device=<path>` |
+| `detach` | `device=<path>` | `ok` |
+
+The image file must be accessible to both the host daemon and the
+container (shared bind mount or host-path device). The daemon validates
+that the requested file belongs to the calling container's rootfs or an
+explicitly allowed path, preventing escape.
+
+### Separation of concerns
+
+| Layer | Responsibility |
+| ----- | -------------- |
+| Container (imagecraft) | Filesystem policy: which mkfs, which options, which content, which offset/size |
+| Host daemon | Privilege mechanism: loop device lifecycle, device injection, cgroup rules |
+| LXD config | Mount syscall interception for the specific filesystem type |
+
+This keeps the "zero privilege in the container" property for all
+operations except the block device itself, and ensures the filesystem is
+always created by the target release's tools.
+
+### When this is NOT needed
+
+If a filesystem's tools gain offset and populate support (as ext4 and
+FAT already have), the daemon is unnecessary for that type. Upstreaming
+`-d` / `--offset` / equivalent into additional mkfs implementations is
+the long-term preferred path.
+
+---
+
 ## Summary of changed files
 
 | File                                           | What changed                                                                                                                                                         |
