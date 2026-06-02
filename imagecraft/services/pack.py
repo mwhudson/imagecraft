@@ -64,12 +64,32 @@ class ImagecraftPackService(PackageService):
             )
             for s in volume.structure
         }
+
+        # Determine if /boot is a separate partition by inspecting the
+        # filesystems configuration.
+        boot_partition_name: str | None = None
+        filesystems = getattr(project, "filesystems", None) or {}
+        for _fs_name, fs_entries in filesystems.items():
+            if not isinstance(fs_entries, list):
+                continue
+            for entry in fs_entries:
+                mount = entry.get("mount", "")
+                if mount.rstrip("/") == "/boot":
+                    device = str(entry.get("device", "")).strip("()")
+                    # device is like "volume/pc/boot" — extract the
+                    # structure name (last component).
+                    parts = device.split("/")
+                    if len(parts) >= 3:  # noqa: PLR2004
+                        boot_partition_name = parts[-1]
+                    break
+
         grub_assets = grubutil.prepare_grub_assets(
             arch=arch,
             volume_name=volume_name,
             volume=volume,
             prime_dirs=prime_dirs_map,
             workdir=project_dirs.work_dir,
+            boot_partition_name=boot_partition_name,
         )
 
         for structure_item in volume.structure:
@@ -110,6 +130,12 @@ class ImagecraftPackService(PackageService):
                 and structure_item.name == grub_assets.rootfs_partition_name
             ):
                 partition_uuid = grub_assets.rootfs_uuid
+            elif (
+                grub_assets is not None
+                and grub_assets.boot_partition_name is not None
+                and structure_item.name == grub_assets.boot_partition_name
+            ):
+                partition_uuid = grub_assets.boot_uuid
 
             diskutil.format_populate_partition(
                 fstype=structure_item.filesystem,

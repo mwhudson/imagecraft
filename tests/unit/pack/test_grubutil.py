@@ -294,7 +294,7 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
     # /tmp/imagecraft-core.img inside the chroot (which IS rootfs_prime).
     (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid):
+    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
         # rootfs_uuid must be a valid UUID string.
         uuid_mod.UUID(rootfs_uuid)
         # Reproduce what _build_grub_in_chroot would create.
@@ -305,6 +305,9 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
         (rootfs_prime / "boot" / "grub" / "grub.cfg").write_text("menuentry...")
         # Sanity: core_prefix should point at the rootfs partition.
         assert "gpt2" in core_prefix
+        # No separate /boot: search_uuid == rootfs_uuid
+        assert search_uuid == rootfs_uuid
+        assert grub_prefix == "($root)/boot/grub"
 
     mock_chroot_cls = mocker.patch("imagecraft.pack.grubutil.Chroot")
     mock_chroot_cls.return_value.execute.side_effect = fake_execute
@@ -358,7 +361,7 @@ def test_prepare_grub_assets_amd64_gpt_with_bios_boot(
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid):
+    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # rootfs is the third partition in this layout (bios-boot, efi,
@@ -386,7 +389,7 @@ def test_prepare_grub_assets_amd64_mbr(mocker, tmp_path, mbr_volume_boot_rootfs)
     rootfs_prime = prime_dirs["volume/pc/rootfs"]
     _populate_rootfs_with_grub_files(rootfs_prime)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid):
+    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
         # MBR prefix uses msdos<N>, not gpt<N>.
@@ -422,7 +425,7 @@ def test_prepare_grub_assets_missing_shim_raises(
     bios_dir.mkdir(parents=True, exist_ok=True)
     (bios_dir / "boot.img").write_bytes(b"X" * 512)
 
-    def fake_execute(*, target, core_prefix, rootfs_uuid):
+    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
         (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
         (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
 
@@ -587,3 +590,91 @@ def test_mount_supports_bind():
     m = Mount(fstype=None, src="/dev", relative_mountpoint="/dev", options=["--bind"])
     assert m._options == ["--bind"]
     assert m._fstype is None
+
+
+# ── Separate /boot partition ──────────────────────────────────────────────────
+
+
+@pytest.fixture
+def gpt_volume_efi_boot_rootfs():
+    return GPTVolume.unmarshal(
+        {
+            "schema": "gpt",
+            "structure": [
+                {
+                    "name": "efi",
+                    "role": "system-boot",
+                    "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+                    "filesystem": "vfat",
+                    "size": "256M",
+                    "filesystem-label": "EFI System",
+                },
+                {
+                    "name": "boot",
+                    "role": "system-boot",
+                    "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+                    "filesystem": "ext4",
+                    "size": "512M",
+                    "filesystem-label": "boot",
+                },
+                {
+                    "name": "rootfs",
+                    "role": "system-data",
+                    "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+                    "filesystem": "ext4",
+                    "size": "5G",
+                    "filesystem-label": "writable",
+                },
+            ],
+        }
+    )
+
+
+def test_prepare_grub_assets_separate_boot_partition(
+    mocker, tmp_path, gpt_volume_efi_boot_rootfs
+):
+    """When /boot is a separate partition, ESP stub uses boot UUID and /grub prefix."""
+    prime_dirs = _make_prime_dirs(tmp_path, "pc", gpt_volume_efi_boot_rootfs.structure)
+    rootfs_prime = prime_dirs["volume/pc/rootfs"]
+    esp_prime = prime_dirs["volume/pc/efi"]
+    _populate_rootfs_with_grub_files(rootfs_prime)
+    (rootfs_prime / "tmp").mkdir(parents=True, exist_ok=True)
+
+    def fake_execute(*, target, core_prefix, rootfs_uuid, search_uuid, grub_prefix):
+        uuid_mod.UUID(rootfs_uuid)
+        uuid_mod.UUID(search_uuid)
+        # search_uuid must differ from rootfs_uuid (it's the boot UUID)
+        assert search_uuid != rootfs_uuid
+        # prefix points at boot partition (gpt2) with /grub path
+        assert core_prefix == "(,gpt2)/grub"
+        assert grub_prefix == "($root)/grub"
+        (rootfs_prime / "tmp" / "imagecraft-core.img").write_bytes(b"CORE")
+        (rootfs_prime / "boot" / "grub").mkdir(parents=True, exist_ok=True)
+        (rootfs_prime / "boot" / "grub" / "grub.cfg").write_text("menuentry...")
+
+    mock_chroot_cls = mocker.patch("imagecraft.pack.grubutil.Chroot")
+    mock_chroot_cls.return_value.execute.side_effect = fake_execute
+
+    result = prepare_grub_assets(
+        arch=DebianArchitecture.AMD64,
+        volume_name="pc",
+        volume=gpt_volume_efi_boot_rootfs,
+        prime_dirs=prime_dirs,
+        workdir=tmp_path / "wd",
+        boot_partition_name="boot",
+    )
+
+    assert result is not None
+    assert result.rootfs_uuid is not None
+    assert result.boot_uuid is not None
+    assert result.boot_uuid != result.rootfs_uuid
+    assert result.boot_partition_name == "boot"
+    assert result.rootfs_partition_name == "rootfs"
+
+    # ESP grub.cfg stub should use the boot UUID, not rootfs UUID.
+    esp_grub_cfg = (esp_prime / "EFI/ubuntu/grub.cfg").read_text()
+    assert f"search.fs_uuid {result.boot_uuid} root" in esp_grub_cfg
+    assert "($root)/grub" in esp_grub_cfg
+    # Should NOT reference rootfs UUID or /boot/grub in the stub.
+    assert result.rootfs_uuid not in esp_grub_cfg
+    assert "/boot/grub" not in esp_grub_cfg
