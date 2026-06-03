@@ -126,9 +126,9 @@ search.fs_uuid {search_uuid} root
 set prefix={grub_prefix}
 """
 
-_OS_PROBER_PATH = "/etc/grub.d/30_os-prober"
+_OS_PROBER_PATH = Path("/etc/grub.d/30_os-prober")
 
-_GRUB_PROBE_PATH = "/usr/sbin/grub-probe"
+_GRUB_PROBE_PATH = Path("/usr/sbin/grub-probe")
 
 # Shell script written over the real grub-probe while update-grub runs inside
 # the chroot.  grub-mkconfig calls grub-probe to discover the block device and
@@ -217,7 +217,7 @@ esac
 exit 0
 """
 
-_GRUB_MKRELPATH_PATH = "/usr/bin/grub-mkrelpath"
+_GRUB_MKRELPATH_PATH = Path("/usr/bin/grub-mkrelpath")
 
 # Shell script written over the real grub-mkrelpath when /boot is a separate
 # partition.  grub-mkconfig's make_system_path_relative_to_its_root() calls
@@ -489,7 +489,7 @@ def prepare_grub_assets(  # noqa: PLR0912, PLR0915 — phase-B orchestration is 
 
     if core_img_src.is_file():
         core_img_dst = assets_dir / "core.img"
-        shutil.move(str(core_img_src), str(core_img_dst))
+        shutil.move(core_img_src, core_img_dst)
     else:
         emit.progress(
             f"WARNING: core.img not produced at {core_img_src}; "
@@ -586,6 +586,11 @@ def install_grub_to_image(image: "Image", assets: GrubAssets) -> None:
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
+
+
+def _divert_target(path: Path) -> Path:
+    """Path that ``dpkg-divert --rename`` moves the real binary aside to."""
+    return path.with_name(path.name + ".dpkg-divert")
 
 
 def _find_structure(volume: "Volume", role: Role) -> StructureItem | None:
@@ -729,21 +734,21 @@ def _build_grub_in_chroot(
     os_prober_divert_args = [
         "--local",
         "--divert",
-        _OS_PROBER_PATH + ".dpkg-divert",
+        _divert_target(_OS_PROBER_PATH),
         "--rename",
         _OS_PROBER_PATH,
     ]
     grub_probe_divert_args = [
         "--local",
         "--divert",
-        _GRUB_PROBE_PATH + ".dpkg-divert",
+        _divert_target(_GRUB_PROBE_PATH),
         "--rename",
         _GRUB_PROBE_PATH,
     ]
     grub_mkrelpath_divert_args = [
         "--local",
         "--divert",
-        _GRUB_MKRELPATH_PATH + ".dpkg-divert",
+        _divert_target(_GRUB_MKRELPATH_PATH),
         "--rename",
         _GRUB_MKRELPATH_PATH,
     ]
@@ -764,26 +769,26 @@ def _build_grub_in_chroot(
     # an unprivileged container because the block device backing the ZFS
     # root is not exposed in the container's /dev.
     run("dpkg-divert", *grub_probe_divert_args, stderr=subprocess.STDOUT)
-    Path(_GRUB_PROBE_PATH).write_text(
+    _GRUB_PROBE_PATH.write_text(
         _GRUB_PROBE_STUB.replace("@@ROOTFS_UUID@@", rootfs_uuid).replace(
             "@@BOOT_UUID@@", boot_uuid or ""
         )
     )
-    Path(_GRUB_PROBE_PATH).chmod(0o755)
+    _GRUB_PROBE_PATH.chmod(0o755)
     # When /boot is a separate partition, also divert grub-mkrelpath so the
     # generated grub.cfg uses boot-partition-relative kernel paths
     # (``/vmlinuz``, not ``/boot/vmlinuz``).  The same-filesystem bind mount
     # at /boot is invisible to the real tool's st_dev-based detection.
     if separate_boot:
-        if not Path(_GRUB_MKRELPATH_PATH).is_file():
+        if not _GRUB_MKRELPATH_PATH.is_file():
             raise errors.GRUBInstallError(
                 f"grub-mkrelpath not found at {_GRUB_MKRELPATH_PATH}; cannot "
                 "generate boot-partition-relative kernel paths for a separate "
                 "/boot partition."
             )
         run("dpkg-divert", *grub_mkrelpath_divert_args, stderr=subprocess.STDOUT)
-        Path(_GRUB_MKRELPATH_PATH).write_text(_GRUB_MKRELPATH_STUB)
-        Path(_GRUB_MKRELPATH_PATH).chmod(0o755)
+        _GRUB_MKRELPATH_PATH.write_text(_GRUB_MKRELPATH_STUB)
+        _GRUB_MKRELPATH_PATH.chmod(0o755)
     # 10_linux.in checks ``test -e /dev/disk/by-uuid/$GRUB_DEVICE_UUID``
     # to decide whether to use ``root=UUID=...`` or fall back to the raw
     # device name.  Create a symlink so the check passes and the
@@ -802,7 +807,7 @@ def _build_grub_in_chroot(
         raise errors.GRUBInstallError("Failed to run update-grub") from err
     finally:
         by_uuid_link.unlink(missing_ok=True)
-        Path(_GRUB_PROBE_PATH).unlink(missing_ok=True)
+        _GRUB_PROBE_PATH.unlink(missing_ok=True)
         run(
             "dpkg-divert",
             "--remove",
@@ -810,7 +815,7 @@ def _build_grub_in_chroot(
             stderr=subprocess.STDOUT,
         )
         if separate_boot:
-            Path(_GRUB_MKRELPATH_PATH).unlink(missing_ok=True)
+            _GRUB_MKRELPATH_PATH.unlink(missing_ok=True)
             run(
                 "dpkg-divert",
                 "--remove",
@@ -842,7 +847,7 @@ def _build_grub_in_chroot(
             "-p",
             core_prefix,
             "-c",
-            str(early_cfg_path),
+            early_cfg_path,
             "-o",
             "/tmp/imagecraft-core.img",  # noqa: S108 — inside the chroot's tmp
             *_CORE_IMG_MODULES,
