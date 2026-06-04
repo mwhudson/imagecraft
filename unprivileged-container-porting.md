@@ -531,6 +531,101 @@ this path still needs a real boot test.
 
 ---
 
+## Obstacle 8: a hand-written ESP is incomplete vs. `grub-install`
+
+_Phase: packing — ESP population in `prepare_grub_assets`, plus the
+in-chroot core-image build (extends obstacle 3)._
+
+### Root cause
+
+Obstacle 3 replaced `grub-install` with a hand-rolled flow that wrote
+only the bare minimum to boot in the common case: the signed shim at
+`EFI/BOOT/BOOTX64.EFI`, the signed shim + signed grub + a chainload
+`grub.cfg` stub under `EFI/ubuntu/`, and the raw `boot.img`/`core.img`
+bytes. Compared with what real `grub-install --uefi-secure-boot
+--no-nvram` leaves on disk — which is exactly what cloud images run
+(`livecd-rootfs`, `ubuntu-cpc/hooks.d/base/disk-image-uefi.binary`,
+against a loop device we cannot use here) — two things were missing, and
+both bite outside the happy path.
+
+**1. The EFI removable-media boot path had no second stage.** imagecraft
+produces an offline disk image and cannot call `efibootmgr` (there are no
+EFI variables to write, and the image is not the running system), so a
+freshly-written image has **no NVRAM boot entry**. On first boot the
+firmware therefore falls back to the removable media path
+`\EFI\BOOT\BOOTX64.EFI`, which is shim. Shim then either loads its second
+stage (`grubx64.efi`) from its **own** directory or, if a fallback binary
+`fbx64.efi` is present there, launches that instead. imagecraft's
+`EFI/BOOT/` contained only shim — no `grubx64.efi` next to it and no
+`fbx64.efi` — so shim had nothing to hand off to and the image did not
+boot via the removable path. `grub-install` handles this in
+`also_install_removable()` (Ubuntu patch
+`ubuntu-grub-install-extra-removable.patch`) together with the signed
+install (`ubuntu-install-signed.patch`): it populates `EFI/BOOT/` with
+shim + `fbx64.efi` + `mmx64.efi`, and drops `BOOTX64.CSV` in `EFI/ubuntu/`
+so the fallback can recreate the NVRAM entry. `--no-nvram` (which cloud
+images pass) skips only the `efibootmgr` call; it still installs the
+removable fallback, which is precisely the part an offline image relies
+on.
+
+**2. The grub package postinsts refuse to update a hand-written
+bootloader.** When grub is upgraded inside the running image, the
+`grub-pc` and `grub-efi-amd64` postinsts only reinstall the bootloader if
+a platform *core* image already exists on disk
+(`debian/postinst.in`): `test -e /boot/grub/i386-pc/core.img` for BIOS
+(line ~402) and `-e /boot/grub/$target/core.efi` for EFI (line ~578).
+Real `grub-install` leaves both behind (`util/grub-install.c` writes
+`platdir/core.img` and `platdir/core.efi`); imagecraft's flow wrote
+neither, because it `grub-mkimage`s a BIOS `core.img` straight to a temp
+path for the `dd` step and never touches the EFI platform dir. The result
+is a silent failure mode: the new modules land in `/usr/lib/grub`, but
+the on-disk bootloader is never refreshed, and nothing logs that it was
+skipped.
+
+### Approach
+
+Reproduce the on-disk state `grub-install --uefi-secure-boot --no-nvram`
+produces, without running `grub-install`:
+
+**Removable-path fallback.** `_populate_esp_prime_dir` now also copies, on
+a best-effort basis (surveying the shim-signed filenames at runtime, as it
+already does for shim/grub), MokManager (`mmx64.efi`) to both `EFI/BOOT/`
+and `EFI/ubuntu/`, the fallback `fbx64.efi` to `EFI/BOOT/`, and
+`BOOTX64.CSV` to `EFI/ubuntu/`. If the fallback pair is absent a warning
+is emitted rather than failing the build — matching `grub-install`, which
+treats these as non-critical.
+
+**Postinst gate files.** The in-chroot build (`_build_grub_in_chroot`)
+now produces an `x86_64-efi` `core.efi` via `grub-mkimage` straight into
+`/boot/grub/x86_64-efi/`, and a new `_stage_postinst_gate_files` helper
+copies the BIOS `core.img` into `/boot/grub/i386-pc/`, creates the
+`grubenv` env block (`grub-editenv … create`) that `grub-install` would,
+and seeds the `grub-pc/cloud_style_installation` debconf flag so the BIOS
+postinst reinstalls non-interactively against the boot disk (the same
+flag the cloud hook sets). All of these run inside the chroot, so the
+`/boot` bind-mount from obstacle 7 routes the platform dirs and `grubenv`
+onto the boot partition's prime dir when `/boot` is separate.
+
+The `core.efi` module set mirrors the BIOS `core.img` list but drops
+`biosdisk` (which does not exist for `x86_64-efi`) and adds the EFI video
+stack. That image is not what the signed-shim chain actually executes —
+the signed `grubx64.efi` is — but it is a legitimate Secure-Boot-off
+fallback and, more importantly, the file the EFI postinst gate checks for.
+
+**Trade-offs.** The shim-signed companion filenames (`mmx64.efi` /
+`fbx64.efi` vs. `.signed[.latest]` variants) drift across releases, so
+they are surveyed at runtime; a release that renames them would silently
+fall back to "no removable self-registration" (with the warning) rather
+than failing loudly. The `cloud_style_installation` debconf seed assumes
+the `grub-pc` package is the BIOS bootloader owner, matching cloud images;
+it is harmless if that package is absent. As with obstacles 3, 4 and 7,
+none of this is yet exercised by a real boot in CI — the removable
+fallback chain in particular (shim → `fbx64.efi` → CSV → NVRAM entry →
+`EFI/ubuntu`) is only verified by reasoning against the shim/grub sources
+and unit tests over the staged file layout.
+
+---
+
 ## Future work: supporting filesystems without offset/populate tooling
 
 The current implementation avoids loop devices entirely because ext4 and
@@ -647,13 +742,13 @@ the long-term preferred path.
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `imagecraft/plugins/mmdebstrap_plugin.py`      | Changed `--mode=root` to `--mode=unshare`                                                                                                                            |
 | `imagecraft/pack/diskutil.py`                  | Added offset/size support to `format_populate_partition` and helpers; added `uuid` parameter to `_format_populate_ext_partition`; fixed FAT32 cluster-size selection; added `_gconv_env_prefix()` for mcopy snap compatibility |
-| `imagecraft/pack/grubutil.py`                  | Replaced `grub-install` + loop-mount flow with `grub-mkimage` + prime-dir chroot; added `grub-probe` divert + stub; added UUID pre-allocation; separate-`/boot` support: boot bind-mount, `/`-vs-`/boot` stub resolution, `grub-mkrelpath` divert (obstacle 7) |
+| `imagecraft/pack/grubutil.py`                  | Replaced `grub-install` + loop-mount flow with `grub-mkimage` + prime-dir chroot; added `grub-probe` divert + stub; added UUID pre-allocation; separate-`/boot` support: boot bind-mount, `/`-vs-`/boot` stub resolution, `grub-mkrelpath` divert (obstacle 7); EFI removable-path fallback (shim/`fbx64.efi`/`mmx64.efi`/`BOOTX64.CSV`), `x86_64-efi` `core.efi` + BIOS `core.img` postinst gate files, `grubenv`, cloud-style debconf (obstacle 8) |
 | `imagecraft/pack/rawcontent.py`                | New module: bootloader-agnostic raw-content applier (`RawContent`, `apply_raw_content`)                                                                              |
 | `imagecraft/services/pack.py`                  | Replaced `attach_images`/loop-path flow with offset-based format loop; calls `prepare_grub_assets` + `apply_raw_content`; detects a separate `/boot` and stamps its pre-allocated UUID at format time (obstacle 7) |
 | `imagecraft/services/lifecycle.py`             | Replaced `CRAFT_VOLUME_<NAME>` loop-path vars with `_FILE`/`_OFFSET`/`_SIZE` triples                                                                                 |
 | `imagecraft/pack/image.py`                     | Removed unreferenced loop-device machinery                                                                                                                           |
 | `tests/unit/plugins/test_mmdebstrap_plugin.py` | Updated assertion for `--mode=unshare`                                                                                                                               |
-| `tests/unit/pack/test_grubutil.py`             | Fully rewritten for the new flow                                                                                                                                     |
+| `tests/unit/pack/test_grubutil.py`             | Fully rewritten for the new flow; added coverage for the EFI removable-path fallback files, the missing-fallback warning, and `_stage_postinst_gate_files` (obstacle 8) |
 | `tests/unit/pack/test_diskutil.py`             | Added tests for offset/uuid/FAT32 paths; added tests for `_gconv_env_prefix()`                                                                                       |
 | `tests/unit/pack/test_rawcontent.py`           | New: tests for the generic applier                                                                                                                                   |
 | `tests/unit/services/test_pack.py`             | Updated for new pack-service call sequence                                                                                                                           |
