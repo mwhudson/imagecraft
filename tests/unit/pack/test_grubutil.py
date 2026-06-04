@@ -170,6 +170,9 @@ def _populate_rootfs_with_grub_files(rootfs_prime: Path) -> None:
     shim_dir = rootfs_prime / "usr/lib/shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
     (shim_dir / "shimx64.efi.signed.latest").write_bytes(b"SHIMX64")
+    (shim_dir / "mmx64.efi").write_bytes(b"MOKMGR")
+    (shim_dir / "fbx64.efi").write_bytes(b"FALLBACK")
+    (shim_dir / "BOOTX64.CSV").write_bytes(b"CSV")
 
     grub_dir = rootfs_prime / "usr/lib/grub/x86_64-efi-signed"
     grub_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +384,13 @@ def test_prepare_grub_assets_amd64_gpt_efi(mocker, tmp_path, gpt_volume_efi_root
     assert "configfile" in esp_grub_cfg
     # The ESP stub must use the pre-allocated UUID (not a label search).
     assert f"search.fs_uuid {result.rootfs_uuid} root" in esp_grub_cfg
+
+    # Removable-path fallback files (mirrors grub-install): MokManager on both
+    # paths, fallback + CSV so a fresh image self-registers an EFI boot entry.
+    assert (esp_prime / "EFI/BOOT/mmx64.efi").read_bytes() == b"MOKMGR"
+    assert (esp_prime / "EFI/BOOT/fbx64.efi").read_bytes() == b"FALLBACK"
+    assert (esp_prime / "EFI/ubuntu/mmx64.efi").read_bytes() == b"MOKMGR"
+    assert (esp_prime / "EFI/ubuntu/BOOTX64.CSV").read_bytes() == b"CSV"
 
     # Chroot must have been constructed with the rootfs prime dir as
     # its path (Phase-B: no image partition mount, no loop device).
@@ -809,3 +819,72 @@ def test_mkrelpath_stub_strips_boot_prefix(tmp_path):
     )
     # Flags are ignored; the path is still resolved.
     assert _run_mkrelpath_stub(tmp_path, "-r", "/boot/initrd.img") == "/initrd.img"
+
+
+# ── postinst gate files + EFI removable fallback ──────────────────────────────
+
+
+def test_stage_postinst_gate_files_stages_core_grubenv_and_debconf(mocker, tmp_path):
+    """core.img is copied under i386-pc/, grubenv + cloud-style flag are set."""
+    boot_grub = tmp_path / "boot" / "grub"
+    boot_grub.mkdir(parents=True)
+    bios_core = tmp_path / "tmp" / "imagecraft-core.img"
+    bios_core.parent.mkdir(parents=True)
+    bios_core.write_bytes(b"CORE")
+
+    mock_run = mocker.patch("imagecraft.pack.grubutil.run")
+
+    grubutil._stage_postinst_gate_files(boot_grub=boot_grub, bios_core=bios_core)
+
+    # BIOS postinst gate file present under its platform dir.
+    assert (boot_grub / "i386-pc" / "core.img").read_bytes() == b"CORE"
+    # grubenv created next to grub.cfg, and the cloud-style flag seeded.
+    cmds = [c.args[0] for c in mock_run.call_args_list]
+    assert "grub-editenv" in cmds
+    debconf = next(
+        c for c in mock_run.call_args_list if c.args[0] == "debconf-set-selections"
+    )
+    assert "cloud_style_installation" in debconf.kwargs["input"]
+
+
+def test_stage_postinst_gate_files_is_best_effort(mocker, tmp_path, emitter):
+    """A missing core image and absent tools must not break the build."""
+    boot_grub = tmp_path / "boot" / "grub"
+    boot_grub.mkdir(parents=True)
+    missing_core = tmp_path / "does-not-exist.img"
+
+    mocker.patch("imagecraft.pack.grubutil.run", side_effect=FileNotFoundError)
+
+    # Should not raise even though core.img is absent and the tools are missing.
+    grubutil._stage_postinst_gate_files(boot_grub=boot_grub, bios_core=missing_core)
+
+    assert not (boot_grub / "i386-pc").exists()
+
+
+def test_populate_esp_warns_when_fallback_missing(tmp_path, emitter):
+    """Without shim's fbx64.efi/BOOTX64.CSV, a warning is emitted (non-fatal)."""
+    rootfs_prime = tmp_path / "rootfs"
+    esp_prime = tmp_path / "esp"
+    shim_dir = rootfs_prime / "usr/lib/shim"
+    shim_dir.mkdir(parents=True)
+    (shim_dir / "shimx64.efi.signed.latest").write_bytes(b"SHIMX64")
+    grub_dir = rootfs_prime / "usr/lib/grub/x86_64-efi-signed"
+    grub_dir.mkdir(parents=True)
+    (grub_dir / "grubx64.efi.signed").write_bytes(b"GRUBX64")
+
+    grubutil._populate_esp_prime_dir(
+        rootfs_prime=rootfs_prime,
+        esp_prime=esp_prime,
+        search_uuid="11111111-1111-1111-1111-111111111111",
+        grub_prefix="($root)/boot/grub",
+    )
+
+    # The core shim is still written; only the fallback pair is absent.
+    assert (esp_prime / "EFI/BOOT/BOOTX64.EFI").read_bytes() == b"SHIMX64"
+    assert not (esp_prime / "EFI/BOOT/fbx64.efi").exists()
+    emitter.assert_progress(
+        "WARNING: shim fallback (fbx64.efi / BOOTX64.CSV) not found in "
+        "rootfs; the EFI removable-media boot path may not self-register a "
+        "boot entry. Ensure the 'shim-signed' package is installed.",
+        permanent=True,
+    )

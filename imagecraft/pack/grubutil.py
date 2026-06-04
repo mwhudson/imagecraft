@@ -105,6 +105,34 @@ _CORE_IMG_MODULES = [
     "configfile",
 ]
 
+# Modules baked into the x86_64-efi ``core.efi`` gate image (see
+# _build_grub_in_chroot). This image is not the bootloader the signed-shim
+# chain actually runs — that is the signed grubx64.efi on the ESP — but real
+# ``grub-install`` leaves an equivalent ``/boot/grub/x86_64-efi/core.efi`` on
+# disk, and the grub-efi postinst refuses to reinstall on upgrade unless that
+# file exists (debian/postinst.in: ``-e /boot/grub/$target/core.efi``). The
+# module set mirrors _CORE_IMG_MODULES but drops ``biosdisk`` (BIOS-only) and
+# adds the EFI video stack so the image is a usable Secure-Boot-off fallback.
+_CORE_EFI_MODULES = [
+    "part_gpt",
+    "part_msdos",
+    "ext2",
+    "fat",
+    "search",
+    "search_label",
+    "search_fs_uuid",
+    "search_fs_file",
+    "normal",
+    "linux",
+    "configfile",
+    "boot",
+    "efi_gop",
+    "efi_uga",
+    "all_video",
+    "gfxterm",
+    "font",
+]
+
 # Chainload stub written to /EFI/ubuntu/grub.cfg on the ESP. Tells the
 # signed grub on the ESP to hand off to the kernel-listing grub.cfg on
 # the rootfs partition. The rootfs is located by its pre-allocated UUID
@@ -829,16 +857,22 @@ def _build_grub_in_chroot(
             stderr=subprocess.STDOUT,
         )
 
-    # grub-mkimage to produce the BIOS core.img. An embedded early config
-    # (-c) searches for the rootfs by UUID and sets $prefix, so the core
-    # can find /boot/grub/grub.cfg regardless of partition numbering.
-    # The -p prefix serves as a fallback if the early config fails.
+    # grub-mkimage to produce the GRUB core images. An embedded early config
+    # (-c) searches for the boot fs by UUID and sets $prefix, so the core can
+    # find grub.cfg regardless of partition numbering; the -p prefix is the
+    # fallback if the early config fails. Two images are produced:
+    #   * the BIOS core.img, written to /tmp for the parent to dd into the
+    #     BIOS-boot partition / post-MBR gap (and later staged under
+    #     /boot/grub/i386-pc/ as the grub-pc postinst gate file);
+    #   * an x86_64-efi core.efi, written straight to /boot/grub/x86_64-efi/
+    #     as the grub-efi postinst gate file (see _stage_postinst_gate_files).
     early_cfg_path = Path("/tmp/imagecraft-early.cfg")  # noqa: S108
     early_cfg_path.write_text(
         _CORE_EARLY_CFG_TEMPLATE.format(
             search_uuid=search_uuid, grub_prefix=grub_prefix
         )
     )
+    efi_platdir = Path("/boot/grub") / _GRUB_EFI_TARGET_X86_64
     try:
         run(
             "grub-mkimage",
@@ -853,15 +887,87 @@ def _build_grub_in_chroot(
             *_CORE_IMG_MODULES,
             stderr=subprocess.STDOUT,
         )
+        efi_platdir.mkdir(parents=True, exist_ok=True)
+        run(
+            "grub-mkimage",
+            "-O",
+            _GRUB_EFI_TARGET_X86_64,
+            "-p",
+            core_prefix,
+            "-c",
+            early_cfg_path,
+            "-o",
+            str(efi_platdir / "core.efi"),
+            *_CORE_EFI_MODULES,
+            stderr=subprocess.STDOUT,
+        )
     except FileNotFoundError:
         emit.progress(
-            "grub-mkimage not available — core.img will not be built",
+            "grub-mkimage not available — core images will not be built",
             permanent=True,
         )
     except subprocess.CalledProcessError as err:
-        raise errors.GRUBInstallError("Failed to build grub core.img") from err
+        raise errors.GRUBInstallError("Failed to build grub core image") from err
     finally:
         early_cfg_path.unlink(missing_ok=True)
+
+    _stage_postinst_gate_files()
+
+
+def _stage_postinst_gate_files(
+    boot_grub: Path = Path("/boot/grub"),
+    bios_core: Path = Path("/tmp/imagecraft-core.img"),  # noqa: S108 — chroot tmp
+) -> None:
+    """Leave the on-disk files grub's postinsts require to update on upgrade.
+
+    Runs inside the rootfs chroot, after the core images are built (the
+    defaults are the chroot-absolute paths; tests override them). Real
+    ``grub-install`` populates ``/boot/grub/<platform>/`` and a ``grubenv``;
+    the ``grub-pc`` and ``grub-efi-amd64`` postinsts refuse to reinstall the
+    bootloader on package upgrade unless the platform core image is present
+    (``debian/postinst.in``: ``-e /boot/grub/i386-pc/core.img`` for BIOS,
+    ``-e /boot/grub/$target/core.efi`` for EFI). Without these gate files an
+    imagecraft image silently stops receiving bootloader updates.
+
+    The x86_64-efi ``core.efi`` is written by the caller; here we stage the
+    BIOS ``core.img`` under its platform dir, create the ``grubenv`` env block
+    that ``grub-install`` would, and set the cloud-style debconf flag so the
+    ``grub-pc`` postinst reinstalls non-interactively the way cloud images do
+    (livecd-rootfs sets the same flags). All steps are best-effort: a missing
+    tool degrades upgrade-time refresh but does not break the build.
+    """
+    # BIOS core.img: the dd'd copy lives in /tmp; the postinst gate wants it
+    # under the platform dir too.
+    if bios_core.is_file():
+        bios_platdir = boot_grub / _GRUB_BIOS_TARGET
+        bios_platdir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bios_core, bios_platdir / "core.img")
+
+    # grubenv: grub-install writes a 1 KiB env block here; Ubuntu's grub.cfg
+    # reads/writes it for recordfail and GRUB_DEFAULT=saved.
+    try:
+        run("grub-editenv", boot_grub / "grubenv", "create", stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        emit.progress(
+            "grub-editenv not available — grubenv not created", permanent=True
+        )
+
+    # Cloud-style install flag: makes grub-pc's postinst run grub-install
+    # against the boot disk non-interactively on upgrade.
+    try:
+        run(
+            "debconf-set-selections",
+            input=(
+                "grub-pc grub-pc/cloud_style_installation boolean true\n"
+                "grub-pc grub-efi/cloud_style_installation boolean true\n"
+            ),
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        emit.progress(
+            "debconf-set-selections not available — cloud-style flag not set",
+            permanent=True,
+        )
 
 
 def _populate_esp_prime_dir(
@@ -912,6 +1018,31 @@ def _populate_esp_prime_dir(
             "ensure the 'grub-efi-amd64-signed' package is installed."
         )
 
+    # MokManager and the fallback binary + boot CSV come from shim-signed.
+    # They are "best effort" — grub-install treats them as non-fatal — but the
+    # fallback pair is what lets the EFI *removable* media path self-register:
+    # on a freshly-written image (no NVRAM boot entry) firmware runs
+    # EFI/BOOT/BOOTX64.EFI (shim), which launches fbx64.efi, which reads
+    # BOOTX64.CSV to create the "ubuntu" boot entry pointing at EFI/ubuntu.
+    # Without them such an image may not boot via the removable path.
+    mok_src = _find_first_existing(
+        rootfs_prime,
+        [
+            "usr/lib/shim/mmx64.efi.signed.latest",
+            "usr/lib/shim/mmx64.efi.signed",
+            "usr/lib/shim/mmx64.efi",
+        ],
+    )
+    fb_src = _find_first_existing(
+        rootfs_prime,
+        [
+            "usr/lib/shim/fbx64.efi.signed.latest",
+            "usr/lib/shim/fbx64.efi.signed",
+            "usr/lib/shim/fbx64.efi",
+        ],
+    )
+    bootcsv_src = _find_first_existing(rootfs_prime, ["usr/lib/shim/BOOTX64.CSV"])
+
     efi_boot = esp_prime / "EFI" / "BOOT"
     efi_ubuntu = esp_prime / "EFI" / "ubuntu"
     efi_boot.mkdir(parents=True, exist_ok=True)
@@ -925,6 +1056,23 @@ def _populate_esp_prime_dir(
             search_uuid=search_uuid, grub_prefix=grub_prefix
         )
     )
+
+    # Removable-path fallback (mirrors grub-install's also_install_removable()
+    # plus the signed-install MokManager/CSV placement).
+    if mok_src is not None:
+        shutil.copy2(mok_src, efi_boot / "mmx64.efi")
+        shutil.copy2(mok_src, efi_ubuntu / "mmx64.efi")
+    if fb_src is not None:
+        shutil.copy2(fb_src, efi_boot / "fbx64.efi")
+    if bootcsv_src is not None:
+        shutil.copy2(bootcsv_src, efi_ubuntu / "BOOTX64.CSV")
+    if fb_src is None or bootcsv_src is None:
+        emit.progress(
+            "WARNING: shim fallback (fbx64.efi / BOOTX64.CSV) not found in "
+            "rootfs; the EFI removable-media boot path may not self-register a "
+            "boot entry. Ensure the 'shim-signed' package is installed.",
+            permanent=True,
+        )
 
 
 def _find_first_existing(base: Path, candidates: list[str]) -> Path | None:
